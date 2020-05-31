@@ -1,0 +1,17 @@
+name=Gist
+version=1.0.0
+author=Adam Stark [http://www.adamstark.co.uk](http://www.adamstark.co.uk)
+maintainer=Jay Reynolds, Ray Haleblian
+description=Gist is a C++ based audio analysis library.
+examples=
+license=LGPL 3.0
+url=https://github.com/yoyodyne-research/Gist
+board=*
+dependencies=
+LDFLAGS=
+LDLIBS=-lNE10
+CXXFLAGS=
+CC=
+CXX=
+CFLAGS=
+CPPFLAGS=

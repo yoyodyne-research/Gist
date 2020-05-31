@@ -1,0 +1,2 @@
+
+rsync -rv --delete src/ $HOME/Bela/libraries/Gist/
