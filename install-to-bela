@@ -1,2 +1,2 @@
-
 rsync -rv --delete src/ $HOME/Bela/libraries/Gist/
+rsync -rv lib/kiss_fft130/ $HOME/Bela/libraries/Gist/kiss_fft130/
