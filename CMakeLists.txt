@@ -1,4 +1,4 @@
-cmake_minimum_required (VERSION 3.12)
+cmake_minimum_required (VERSION 3.7.2)
 project (Gist VERSION 1.0.7)
 
 set (CMAKE_CXX_STANDARD 11)
