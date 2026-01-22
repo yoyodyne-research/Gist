@@ -1,0 +1,3 @@
+[submodule "libs/carfac/upstream"]
+	path = libs/carfac/upstream
+	url = https://github.com/google/carfac

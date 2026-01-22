@@ -6,6 +6,8 @@ set (CMAKE_CXX_STANDARD 11)
 option (BUILD_TESTS "Build tests" OFF)
 
 add_subdirectory (src)
+add_subdirectory (libs/pffft OPTIONAL)
+add_subdirectory (libs/carfac OPTIONAL)
 
 if (BUILD_TESTS)
     enable_testing()
@@ -13,4 +15,3 @@ if (BUILD_TESTS)
 endif (BUILD_TESTS)
 
 set (CMAKE_SUPPRESS_REGENERATION true)
-

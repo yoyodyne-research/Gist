@@ -1,0 +1,8 @@
+torch>=2.0
+numpy>=1.22
+scipy>=1.9
+mido>=1.2
+matplotlib>=3.6
+pyyaml>=6.0
+# Install ncps separately (editable) from the cloned repo next to Gist:
+#   pip install -e ../ncps
