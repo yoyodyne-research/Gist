@@ -23,6 +23,7 @@
 
 #include <stdlib.h>  // for size_t
 #include "CoreTimeDomainFeatures.h"
+#include "NeonOps.h"
 
 //===========================================================
 template <class T>
@@ -40,11 +41,19 @@ T CoreTimeDomainFeatures<T>::rootMeanSquare (const std::vector<T>& buffer)
     // sum the squared samples
     for (size_t i = 0; i < buffer.size(); i++)
     {
-        sum += pow (buffer[i], 2);
+        sum += buffer[i] * buffer[i];
     }
 
     // return the square root of the mean of squared samples
     return sqrt (sum / ((T)buffer.size()));
+}
+
+// Float specialization using NEON
+template <>
+float CoreTimeDomainFeatures<float>::rootMeanSquare (const std::vector<float>& buffer)
+{
+    float sum = gist_neon::sum_squares_f32(buffer.data(), buffer.size());
+    return std::sqrt(sum / (float)buffer.size());
 }
 
 //===========================================================
@@ -52,7 +61,7 @@ template <class T>
 T CoreTimeDomainFeatures<T>::peakEnergy (const std::vector<T>& buffer)
 {
     // create variable with very small value to hold the peak value
-    T peak = -10000.0;
+    T peak = 0.0;
 
     // for each audio sample
     for (size_t i = 0; i < buffer.size(); i++)
@@ -70,6 +79,13 @@ T CoreTimeDomainFeatures<T>::peakEnergy (const std::vector<T>& buffer)
 
     // return the peak value
     return peak;
+}
+
+// Float specialization using NEON
+template <>
+float CoreTimeDomainFeatures<float>::peakEnergy (const std::vector<float>& buffer)
+{
+    return gist_neon::max_abs_f32(buffer.data(), buffer.size());
 }
 
 //===========================================================

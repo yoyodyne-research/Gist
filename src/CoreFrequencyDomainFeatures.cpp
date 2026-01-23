@@ -23,6 +23,7 @@
 
 #include <stdlib.h>  // for size_t on Bela
 #include "CoreFrequencyDomainFeatures.h"
+#include "NeonOps.h"
 
 //===========================================================
 template <class T>
@@ -61,6 +62,20 @@ T CoreFrequencyDomainFeatures<T>::spectralCentroid (const std::vector<T>& magnit
     {
         return 0.0;
     }
+}
+
+// Float specialization using NEON
+template <>
+float CoreFrequencyDomainFeatures<float>::spectralCentroid (const std::vector<float>& magnitudeSpectrum)
+{
+    float sumAmplitudes;
+    float sumWeightedAmplitudes = gist_neon::weighted_sum_f32(
+        magnitudeSpectrum.data(), magnitudeSpectrum.size(), &sumAmplitudes);
+
+    if (sumAmplitudes > 0)
+        return sumWeightedAmplitudes / sumAmplitudes;
+    else
+        return 0.0f;
 }
 
 //===========================================================
@@ -124,6 +139,25 @@ T CoreFrequencyDomainFeatures<T>::spectralCrest (const std::vector<T>& magnitude
     }
 
     return spectralCrest;
+}
+
+// Float specialization using NEON
+template <>
+float CoreFrequencyDomainFeatures<float>::spectralCrest (const std::vector<float>& magnitudeSpectrum)
+{
+    float maxVal;
+    float sumVal = gist_neon::sum_squares_and_max_f32(
+        magnitudeSpectrum.data(), magnitudeSpectrum.size(), &maxVal);
+
+    if (sumVal > 0)
+    {
+        float meanVal = sumVal / (float)magnitudeSpectrum.size();
+        return maxVal / meanVal;
+    }
+    else
+    {
+        return 1.0f;
+    }
 }
 
 //===========================================================

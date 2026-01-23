@@ -31,8 +31,20 @@ add_library (
 
 source_group (Source src)
 
-math(EXPR _num_backends \
-    "${USE_KISS_FFT}+${USE_PFFFT}+${USE_FFTW}+${USE_ACCELERATE_FFT}")
+# Count enabled FFT backends
+set(_num_backends 0)
+if (USE_KISS_FFT)
+    math(EXPR _num_backends "${_num_backends}+1")
+endif()
+if (USE_PFFFT)
+    math(EXPR _num_backends "${_num_backends}+1")
+endif()
+if (USE_FFTW)
+    math(EXPR _num_backends "${_num_backends}+1")
+endif()
+if (USE_ACCELERATE_FFT)
+    math(EXPR _num_backends "${_num_backends}+1")
+endif()
 if (NOT _num_backends EQUAL 1)
     message(FATAL_ERROR "Select exactly one FFT backend: USE_KISS_FFT, USE_PFFFT, USE_FFTW, or USE_ACCELERATE_FFT")
 endif()

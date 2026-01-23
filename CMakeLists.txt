@@ -6,8 +6,14 @@ set (CMAKE_CXX_STANDARD 11)
 option (BUILD_TESTS "Build tests" OFF)
 
 add_subdirectory (src)
-add_subdirectory (libs/pffft OPTIONAL)
-add_subdirectory (libs/carfac OPTIONAL)
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/pffft/CMakeLists.txt")
+    add_subdirectory (libs/pffft)
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/carfac/CMakeLists.txt")
+    add_subdirectory (libs/carfac)
+endif()
 
 if (BUILD_TESTS)
     enable_testing()
