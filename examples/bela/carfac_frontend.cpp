@@ -52,10 +52,15 @@ void CarfacFrontend::processSample(float x)
     buffer_.push_back(x);
 #else
     // Stub path: distribute the sample energy into a crude spectral tilt across bands.
+    // Step envelope followers per-sample for correct timing.
     float a = std::fabs(x);
     for (int b = 0; b < bands_; ++b) {
         float w = 1.0f - (float)b / std::max(1, bands_-1); // simple tilt
-        band_sig_[b] = 0.9f * band_sig_[b] + 0.1f * (w * a);
+        float sig = w * a;
+        band_sig_[b] = sig;
+        // Step envelopes per-sample (stored in fast_/slow_ for publish to read)
+        fast_[b].step(sig);
+        slow_[b].step(sig);
     }
 #endif
 }
@@ -104,14 +109,11 @@ void CarfacFrontend::publish(std::vector<float>& env_fast,
         }
     }
     #else
-    // Stub: run AR on the crude band_sig_ vector
+    // Stub: read envelope values (already stepped per-sample in processSample)
     for (int b = 0; b < bands_; ++b) {
-        float a = std::fabs(band_sig_[b]);
-        float ef = fast_[b].step(a);
-        float es = slow_[b].step(a);
-        env_fast[b] = ef;
-        env_slow[b] = es;
-        float t = ef - es;
+        env_fast[b] = fast_[b].env;
+        env_slow[b] = slow_[b].env;
+        float t = env_fast[b] - env_slow[b];
         transient[b] = (t > 0.f ? t : 0.f);
     }
     #endif

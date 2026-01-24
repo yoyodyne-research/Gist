@@ -4,7 +4,16 @@ set -euo pipefail
 # Deploy a Bela project using Gist + PFFFT for real-time audio features.
 # - Assembles a local project folder with required sources
 # - rsyncs to the Bela board
-# - Creates a symlink into Bela/projects and runs the project
+# - Optionally builds and runs the project (with --run flag)
+#
+# Usage:
+#   ./deploy_bela.sh         # Sync code only
+#   ./deploy_bela.sh --run   # Sync, build, and run
+
+RUN_PROJECT=false
+if [[ "${1:-}" == "--run" || "${1:-}" == "-r" ]]; then
+    RUN_PROJECT=true
+fi
 
 # Configurable via env vars
 REMOTE_HOST=${REMOTE_HOST:-bela.local}
@@ -25,7 +34,6 @@ mkdir -p "$LOCAL_PROJECT"
 # Copy Bela example files
 cp -v "$REPO_ROOT/examples/bela/render.cpp" "$LOCAL_PROJECT/"
 cp -v "$REPO_ROOT/examples/bela/settings.json" "$LOCAL_PROJECT/"
-cp -v "$REPO_ROOT/examples/bela/flenser.h" "$LOCAL_PROJECT/"
 cp -v "$REPO_ROOT/examples/bela/carfac_frontend.h" "$LOCAL_PROJECT/"
 cp -v "$REPO_ROOT/examples/bela/carfac_frontend.cpp" "$LOCAL_PROJECT/"
 cp -v "$REPO_ROOT/examples/bela/pffft_alloc.c" "$LOCAL_PROJECT/"
@@ -60,6 +68,7 @@ cp -v "$REPO_ROOT/libs/pffft/simd/pf_"*".h" "$LOCAL_PROJECT/pffft/simd/"
 
 # CARFAC (if vendored). Copy any headers/sources into project carfac/ folder.
 if [ -d "$REPO_ROOT/libs/carfac" ]; then
+  EIGEN_VENDORED=""
   mkdir -p "$LOCAL_PROJECT/carfac"
   # Copy headers/sources from the vendored/submodule tree into the staged project
   # Avoid shell parameter expansion pitfalls inside xargs by using a while loop
@@ -143,7 +152,12 @@ echo "Syncing to Bela projects: $REMOTE_HOST:$REMOTE_PROJECT_DIR"
 ssh "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p $REMOTE_PROJECT_ROOT; if [ -L '$REMOTE_PROJECT_DIR' ]; then rm -f '$REMOTE_PROJECT_DIR'; fi; mkdir -p '$REMOTE_PROJECT_DIR'"
 rsync -avz --delete --exclude ".git" "$LOCAL_PROJECT/" "${REMOTE_USER}@${REMOTE_HOST}:$REMOTE_PROJECT_DIR/"
 
-echo "Running project on Bela..."
-ssh "${REMOTE_USER}@${REMOTE_HOST}" "cd /root/Bela && make PROJECT=$REMOTE_PROJECT_NAME run"
-
-echo "Done. Project running on Bela as: $REMOTE_PROJECT_NAME"
+if $RUN_PROJECT; then
+    echo "Building and running project on Bela..."
+    ssh "${REMOTE_USER}@${REMOTE_HOST}" "cd /root/Bela && make PROJECT=$REMOTE_PROJECT_NAME run"
+    echo "Done. Project running on Bela as: $REMOTE_PROJECT_NAME"
+else
+    echo "Done. Code synced to Bela. To build and run:"
+    echo "  ssh root@$REMOTE_HOST 'cd /root/Bela && make PROJECT=$REMOTE_PROJECT_NAME run'"
+    echo "Or re-run with: $0 --run"
+fi

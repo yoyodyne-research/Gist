@@ -6,24 +6,14 @@
 #include <memory>
 #include "Gist.h"
 #include "pffft.h" // for runtime SIMD check
-#include "flenser.h" // multiband envelopes
-
-// Auto-detect CARFAC headers staged in the project and enable frontend by default
-#if !defined(HAVE_CARFAC)
-#  if __has_include("carfac/upstream/cpp/carfac.h")
-#    define HAVE_CARFAC 1
-#  endif
-#endif
-#if !defined(ENABLE_CARFAC_FRONTEND)
-#  if defined(HAVE_CARFAC)
-#    define ENABLE_CARFAC_FRONTEND 1
-#  else
-#    define ENABLE_CARFAC_FRONTEND 0
-#  endif
-#endif
-
-#if ENABLE_CARFAC_FRONTEND
 #include "carfac_frontend.h"
+#if !defined(ENABLE_SCOPE)
+#define ENABLE_SCOPE 1
+#endif
+#if ENABLE_SCOPE
+#include <libraries/Scope/Scope.h>
+#else
+#warning "Scope is DISABLED"
 #endif
 
 #ifdef USE_BITSTREAM_PITCH
@@ -77,12 +67,18 @@ static inline void applyPitchPreset(Gist<float>& gist)
 static constexpr int kFrameSize = 256;   // analysis window size
 static constexpr int kHopSize   = 64;    // tighter responsiveness, keep CPU modest
 
+#if ENABLE_SCOPE
+// Scope visualization: select 6 bands spanning the frequency range
+static constexpr int kScopeBands[] = {0, 3, 6, 9, 12, 15};
+static constexpr int kNumScopeBands = 6;
+#endif
+
 // Analysis
 static std::unique_ptr<Gist<float>> gGist;
 static std::unique_ptr<Gist<float>> gGistPitch;  // separate instance for aux pitch
-static std::unique_ptr<Flenser> gFlenser;        // multiband envelopes
-#if ENABLE_CARFAC_FRONTEND
-static std::unique_ptr<CarfacFrontend> gCarfac;
+static std::unique_ptr<CarfacFrontend> gCarfac;  // CARFAC cochlear frontend
+#if ENABLE_SCOPE
+static Scope gScope;                             // Bela oscilloscope for visualization
 #endif
 static std::vector<float> gRing;            // circular buffer of last kFrameSize samples
 static std::vector<float> gFrame;           // contiguous copy (time-domain)
@@ -118,10 +114,7 @@ bool setup(BelaContext* context, void* userData)
     const int fs = context->audioSampleRate;
     gGist.reset(new Gist<float>(kFrameSize, fs, HanningWindow));
     gGistPitch.reset(new Gist<float>(kFrameSize, fs, HanningWindow));
-    gFlenser.reset(new Flenser());
-#if ENABLE_CARFAC_FRONTEND
     gCarfac.reset(new CarfacFrontend());
-#endif
     #ifdef USE_BITSTREAM_PITCH
     // Apply preset or custom values via compile-time macros. Override in IDE:
     //  -DPITCH_PRESET=6 (GUITAR), 2 (BASS4), 1 (BASS6), etc.
@@ -135,31 +128,7 @@ bool setup(BelaContext* context, void* userData)
 #if ENABLE_MFCC
     gMfcc.assign(13, 0.0f);
 #endif
-#if !ENABLE_CARFAC_FRONTEND
-    // Configure multiband envelopes (LR4) with 6 bands (SVF engine)
-    {
-        std::vector<float> edges;
-        // Default edges (Hz). Adjust per preset if desired.
-        #if defined(PITCH_PRESET) && (PITCH_PRESET==1)
-            edges = { 40.f, 120.f, 300.f, 800.f, 2000.f, 5000.f };
-        #elif defined(PITCH_PRESET) && (PITCH_PRESET==2)
-            edges = { 50.f, 140.f, 320.f, 900.f, 2200.f, 5200.f };
-        #elif defined(PITCH_PRESET) && (PITCH_PRESET==6)
-            edges = { 80.f, 180.f, 400.f, 1000.f, 2500.f, 6000.f };
-        #else
-            edges = { 60.f, 150.f, 350.f, 900.f, 2300.f, 5500.f };
-        #endif
-        gFlenser->configure(fs, edges, 0.005f, 0.040f, 0.020f, 0.200f);
-        const size_t bands = edges.size() + 1;
-        gEnvFast.assign(bands, 0.0f);
-        gEnvSlow.assign(bands, 0.0f);
-        gTransient.assign(bands, 0.0f);
-        rt_printf("Flenser bands=%zu\n", bands);
-    }
-#endif
-
-#if ENABLE_CARFAC_FRONTEND
-    // Configure CARFAC frontend (start with ~16 bands)
+    // Configure CARFAC cochlear frontend
     {
         CarfacFrontend::Params cp;
         cp.sample_rate = fs;
@@ -173,16 +142,17 @@ bool setup(BelaContext* context, void* userData)
         gTransient.assign(bands, 0.0f);
         rt_printf("CARFAC bands=%zu\n", bands);
     }
+#if ENABLE_SCOPE
+    // Initialize Bela Scope for visualizing CARFAC band envelopes
+    gScope.setup(kNumScopeBands, fs);
+    rt_printf("Scope: %d CARFAC bands -> channels\n", kNumScopeBands);
 #endif
+
     gWriteIdx = 0;
     gSamplesSinceHop = 0;
 
     // Log frontend + SIMD backend (non-RT context)
-#if ENABLE_CARFAC_FRONTEND
     rt_printf("Frontend: CARFAC\n");
-#else
-    rt_printf("Frontend: Flenser (SVF)\n");
-#endif
     rt_printf("PFFFT SIMD: %s (size=%d)\n", pffft_simd_arch(), pffft_simd_size());
 
     // Enable flush-to-zero and denormals-are-zero (avoid rare CPU spikes)
@@ -234,19 +204,22 @@ void render(BelaContext* context, void* userData)
 
     for (unsigned int n = 0; n < nFrames; ++n)
     {
-        // Mono input (ch 0). Replace with whatever input you use.
-        float x = audioRead(context, n, 0);
+        // Mono input (ch 1 = right). Replace with whatever input you use.
+        float x = audioRead(context, n, 1);
 
         // Push to ring buffer
         gRing[gWriteIdx] = x;
         gWriteIdx = (gWriteIdx + 1) % kFrameSize;
         gSamplesSinceHop++;
 
-        // Multiband envelopes per-sample
-#if ENABLE_CARFAC_FRONTEND
+        // CARFAC cochlear processing per-sample
         gCarfac->processSample(x);
-#else
-        gFlenser->processSample(x);
+
+#if ENABLE_SCOPE
+        // Log selected CARFAC bands to scope (per-sample envelope values)
+        gScope.log(gCarfac->getEnvFast(kScopeBands[0]), gCarfac->getEnvFast(kScopeBands[1]),
+                   gCarfac->getEnvFast(kScopeBands[2]), gCarfac->getEnvFast(kScopeBands[3]),
+                   gCarfac->getEnvFast(kScopeBands[4]), gCarfac->getEnvFast(kScopeBands[5]));
 #endif
 
         if (gSamplesSinceHop >= kHopSize)
@@ -278,18 +251,9 @@ void render(BelaContext* context, void* userData)
                 }
             }
 
-            // Decimate and publish multiband envelopes (every 256 samples)
+            // Decimate and publish CARFAC envelopes (every 256 samples)
             if ((gFlenserDecim++ & 0x3) == 0) {
-#if ENABLE_CARFAC_FRONTEND
                 gCarfac->publish(gEnvFast, gEnvSlow, gTransient, nullptr);
-#else
-                const auto& ef = gFlenser->env_fast();
-                const auto& es = gFlenser->env_slow();
-                const auto& tr = gFlenser->transients();
-                std::memcpy(gEnvFast.data(), ef.data(), ef.size()*sizeof(float));
-                std::memcpy(gEnvSlow.data(), es.data(), es.size()*sizeof(float));
-                std::memcpy(gTransient.data(), tr.data(), tr.size()*sizeof(float));
-#endif
             }
         }
     }

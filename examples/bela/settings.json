@@ -9,7 +9,7 @@
     "user": "",
     "make": ""
   },
-  "defines": ["USE_PFFFT", "USE_ARM_NEON", "PFFFT_ENABLE_NEON", "__ARM_NEON", "__arm__", "PFFFT_SILENCE_SIMD_MSG", "USE_BITSTREAM_PITCH", "PITCH_PRESET=6", "ENABLE_MFCC=0"],
+  "defines": ["USE_PFFFT", "USE_ARM_NEON", "PFFFT_ENABLE_NEON", "__ARM_NEON", "__arm__", "PFFFT_SILENCE_SIMD_MSG", "USE_BITSTREAM_PITCH", "PITCH_PRESET=6", "ENABLE_MFCC=0", "ENABLE_SCOPE=0"],
   "includes": [".", "pffft", "pffft/simd", "carfac", "carfac/upstream", "carfac/upstream/cpp", "carfac/eigen"],
   "cflags": [
     "-DUSE_PFFFT",
@@ -20,6 +20,7 @@
     "-DUSE_BITSTREAM_PITCH",
     "-DPITCH_PRESET=6",
     "-DENABLE_MFCC=0",
+    "-DENABLE_SCOPE=0",
     "-DPFFFT_SILENCE_SIMD_MSG",
     "-DEIGEN_DONT_PARALLELIZE",
     "-DEIGEN_NO_DEBUG",
@@ -43,6 +44,7 @@
     "-DUSE_BITSTREAM_PITCH",
     "-DPITCH_PRESET=6",
     "-DENABLE_MFCC=0",
+    "-DENABLE_SCOPE=0",
     "-DPFFFT_SILENCE_SIMD_MSG",
     "-DEIGEN_DONT_PARALLELIZE",
     "-DEIGEN_NO_DEBUG",

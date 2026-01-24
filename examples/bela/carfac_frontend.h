@@ -52,6 +52,9 @@ public:
 
     int numBands() const { return bands_; }
 
+    // Get current fast envelope value for a band (updated per-sample)
+    float getEnvFast(int band) const { return fast_[band].env; }
+
 private:
     // Wrapper-side envelope followers
     struct AR {
