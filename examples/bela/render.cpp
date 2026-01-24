@@ -156,17 +156,12 @@ bool setup(BelaContext* context, void* userData)
     rt_printf("PFFFT SIMD: %s (size=%d)\n", pffft_simd_arch(), pffft_simd_size());
 
     // Enable flush-to-zero and denormals-are-zero (avoid rare CPU spikes)
-    #if (defined(__arm__) || defined(__aarch64__) || defined(__arm64__)) && defined(__ARM_NEON)
     {
         unsigned int fpscr = 0;
-        // Read FPSCR
         asm volatile ("vmrs %0, fpscr" : "=r" (fpscr));
-        // Set FZ (bit 24) and DN (bit 19)
-        fpscr |= (1u << 24) | (1u << 19);
-        // Write FPSCR
+        fpscr |= (1u << 24) | (1u << 19);  // FZ (bit 24), DN (bit 19)
         asm volatile ("vmsr fpscr, %0" :: "r" (fpscr));
     }
-    #endif
 
     gPitchTask = Bela_createAuxiliaryTask([](void*) {
         if (!gPitchPending.load(std::memory_order_acquire))
