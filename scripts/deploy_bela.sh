@@ -7,13 +7,36 @@ set -euo pipefail
 # - Optionally builds and runs the project (with --run flag)
 #
 # Usage:
-#   ./deploy_bela.sh         # Sync code only
-#   ./deploy_bela.sh --run   # Sync, build, and run
+#   ./deploy_bela.sh                       # Sync code only
+#   ./deploy_bela.sh --run                 # Sync, build, and run
+#   ./deploy_bela.sh --run --scope         # With Bela Scope enabled
+#   ./deploy_bela.sh --run --carfac-rate 22050  # CARFAC at half sample rate
 
 RUN_PROJECT=false
-if [[ "${1:-}" == "--run" || "${1:-}" == "-r" ]]; then
-    RUN_PROJECT=true
-fi
+USE_SCOPE=false
+CARFAC_RATE=0  # 0 = same as audio rate
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --run|-r)
+            RUN_PROJECT=true
+            shift
+            ;;
+        --scope|--use-scope|--use_scope)
+            USE_SCOPE=true
+            shift
+            ;;
+        --carfac-rate|--carfac_rate)
+            CARFAC_RATE="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Usage: $0 [--run|-r] [--scope] [--carfac-rate RATE]" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # Configurable via env vars
 REMOTE_HOST=${REMOTE_HOST:-bela.local}
@@ -55,6 +78,7 @@ cp -v "$REPO_ROOT/src/OnsetDetectionFunction.h" "$LOCAL_PROJECT/"
 cp -v "$REPO_ROOT/src/MFCC.h" "$LOCAL_PROJECT/"
 cp -v "$REPO_ROOT/src/WindowFunctions.h" "$LOCAL_PROJECT/"
 cp -v "$REPO_ROOT/src/Yin.h" "$LOCAL_PROJECT/"
+cp -v "$REPO_ROOT/src/BitstreamPitch.h" "$LOCAL_PROJECT/"
 cp -v "$REPO_ROOT/src/NeonOps.h" "$LOCAL_PROJECT/" || true
 
 # PFFFT (float-only NEON backend)
@@ -66,18 +90,34 @@ cp -v "$REPO_ROOT/libs/pffft/pffft.h" "$LOCAL_PROJECT/pffft/"
 cp -v "$REPO_ROOT/libs/pffft/pffft_priv_impl.h" "$LOCAL_PROJECT/pffft/"
 cp -v "$REPO_ROOT/libs/pffft/simd/pf_"*".h" "$LOCAL_PROJECT/pffft/simd/"
 
-# CARFAC (if vendored). Copy any headers/sources into project carfac/ folder.
+# CARFAC (if vendored). Copy headers to carfac/ subfolder, but sources to project root for Bela to compile.
 if [ -d "$REPO_ROOT/libs/carfac" ]; then
   EIGEN_VENDORED=""
   mkdir -p "$LOCAL_PROJECT/carfac"
-  # Copy headers/sources from the vendored/submodule tree into the staged project
-  # Avoid shell parameter expansion pitfalls inside xargs by using a while loop
+
+  # Copy headers to carfac/ subfolder (preserving structure for includes)
   while IFS= read -r -d '' src; do
     rel_path="${src#"$REPO_ROOT/libs/carfac/"}"
     dest="$LOCAL_PROJECT/carfac/$rel_path"
     mkdir -p "$(dirname "$dest")"
     cp -v "$src" "$dest"
-  done < <(find "$REPO_ROOT/libs/carfac" -maxdepth 4 \( -name "*.h" -o -name "*.hpp" -o -name "*.cc" -o -name "*.cpp" \) -print0)
+  done < <(find "$REPO_ROOT/libs/carfac" -maxdepth 4 \( -name "*.h" -o -name "*.hpp" \) -print0)
+
+  # Copy CARFAC source AND header files to project ROOT so Bela compiles them
+  # Sources use local includes like #include "carfac.h"
+  # Rename .cc to .cpp since Bela only compiles .cpp files
+  for src in car.cc carfac.cc ear.cc; do
+    if [ -f "$REPO_ROOT/libs/carfac/upstream/cpp/$src" ]; then
+      dst="${src%.cc}.cpp"
+      cp -v "$REPO_ROOT/libs/carfac/upstream/cpp/$src" "$LOCAL_PROJECT/$dst"
+    fi
+  done
+  for hdr in car.h carfac.h ear.h agc.h ihc.h common.h carfac_util.h; do
+    if [ -f "$REPO_ROOT/libs/carfac/upstream/cpp/$hdr" ]; then
+      cp -v "$REPO_ROOT/libs/carfac/upstream/cpp/$hdr" "$LOCAL_PROJECT/"
+    fi
+  done
+  echo "CARFAC sources (.cpp) and headers copied to project root"
 
   # Try to vendor Eigen headers if available on this machine so CARFAC builds on Bela.
   # Check EIGEN3_INCLUDE_DIR first, then common Homebrew/system locations.
@@ -148,16 +188,42 @@ if [ ! -s "$LOCAL_PROJECT/render.cpp" ] || [ ! -s "$LOCAL_PROJECT/Gist.cpp" ]; t
 fi
 
 echo "Syncing to Bela projects: $REMOTE_HOST:$REMOTE_PROJECT_DIR"
+if $USE_SCOPE; then
+    echo "Bela Scope: ENABLED (--scope flag)"
+else
+    echo "Bela Scope: disabled (use --scope to enable)"
+fi
+if [[ "$CARFAC_RATE" -gt 0 ]]; then
+    echo "CARFAC rate: ${CARFAC_RATE} Hz (decimated)"
+else
+    echo "CARFAC rate: full (same as audio rate)"
+fi
 # Ensure a real directory (not a symlink) exists for the project
 ssh "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p $REMOTE_PROJECT_ROOT; if [ -L '$REMOTE_PROJECT_DIR' ]; then rm -f '$REMOTE_PROJECT_DIR'; fi; mkdir -p '$REMOTE_PROJECT_DIR'"
 rsync -avz --delete --exclude ".git" "$LOCAL_PROJECT/" "${REMOTE_USER}@${REMOTE_HOST}:$REMOTE_PROJECT_DIR/"
 
+# Compiler flags for Bela make (settings.json is only for IDE)
+# Set ENABLE_SCOPE based on --scope flag
+if $USE_SCOPE; then
+    SCOPE_FLAG="-DENABLE_SCOPE=1"
+else
+    SCOPE_FLAG="-DENABLE_SCOPE=0"
+fi
+
+BELA_CPPFLAGS="-DUSE_PFFFT -DUSE_ARM_NEON -DPFFFT_ENABLE_NEON -D__ARM_NEON -D__arm__ -DUSE_BITSTREAM_PITCH -DPITCH_PRESET=6 -DENABLE_MFCC=0 $SCOPE_FLAG -DCARFAC_RATE=$CARFAC_RATE -DHAVE_CARFAC -DPFFFT_SILENCE_SIMD_MSG -DEIGEN_DONT_PARALLELIZE -DEIGEN_NO_DEBUG -DEIGEN_MALLOC_ALREADY_ALIGNED=0"
+BELA_CFLAGS="-march=armv7-a -O3 -ffast-math -fno-math-errno -ftree-vectorize -Wno-#pragma-messages -mfpu=neon-vfpv3 -mcpu=cortex-a8 -mfloat-abi=hard"
+BELA_CXXFLAGS="-std=c++11 $BELA_CFLAGS"
+BELA_INCLUDES="-I. -Ipffft -Ipffft/simd -Icarfac -Icarfac/upstream -Icarfac/upstream/cpp -Icarfac/eigen"
+
+# Runtime arguments (block size, etc.)
+BELA_RUN_ARGS=${BELA_RUN_ARGS:-"-p 16 -B 16 -C 8 -N 1 -G 1"}
+
 if $RUN_PROJECT; then
     echo "Building and running project on Bela..."
-    ssh "${REMOTE_USER}@${REMOTE_HOST}" "cd /root/Bela && make PROJECT=$REMOTE_PROJECT_NAME run"
+    ssh "${REMOTE_USER}@${REMOTE_HOST}" "cd /root/Bela && make PROJECT=$REMOTE_PROJECT_NAME CPPFLAGS='$BELA_CPPFLAGS $BELA_INCLUDES' CFLAGS='$BELA_CFLAGS' CXXFLAGS='$BELA_CXXFLAGS' CL='$BELA_RUN_ARGS' run"
     echo "Done. Project running on Bela as: $REMOTE_PROJECT_NAME"
 else
     echo "Done. Code synced to Bela. To build and run:"
-    echo "  ssh root@$REMOTE_HOST 'cd /root/Bela && make PROJECT=$REMOTE_PROJECT_NAME run'"
+    echo "  ssh root@$REMOTE_HOST 'cd /root/Bela && make PROJECT=$REMOTE_PROJECT_NAME CPPFLAGS=\"$BELA_CPPFLAGS $BELA_INCLUDES\" CFLAGS=\"$BELA_CFLAGS\" CXXFLAGS=\"$BELA_CXXFLAGS\" CL=\"$BELA_RUN_ARGS\" run'"
     echo "Or re-run with: $0 --run"
 fi

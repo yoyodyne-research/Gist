@@ -1,32 +1,30 @@
 // CARFAC front-end wrapper for Bela
 //
-// This is a thin adapter around a CARFAC (cochlear) implementation that:
+// This is a thin adapter around the CARFAC (cochlear) library that:
 // - Initializes CAR, IHC, and AGC subsystems for a mono input
-// - Steps the processor per sample (CAR -> IHC -> AGC, with loop closure when required)
-// - Publishes per-band envelopes (fast/slow) and a transient metric at a hop boundary
+// - Processes samples inline via per-sample API (spreads CPU load evenly)
+// - Publishes per-band envelopes (fast/slow) and a transient metric
 //
-// Integration notes:
-// - By default this file builds a stub (no real CARFAC) so the project compiles.
-//   To use the real library, define HAVE_CARFAC and include the appropriate headers
-//   in the implementation (see carfac_frontend.cpp), then link the CARFAC sources.
-// - Use ENABLE_CARFAC_FRONTEND in settings.json to switch render.cpp to this frontend.
+// Requires HAVE_CARFAC to be defined and CARFAC sources to be linked.
 
 #pragma once
+
+#ifndef HAVE_CARFAC
+#error "HAVE_CARFAC must be defined to use CarfacFrontend"
+#endif
 
 #include <vector>
 #include <algorithm>
 #include <cmath>
 #include <memory>
 
-#if defined(HAVE_CARFAC)
 #include "carfac/upstream/cpp/carfac.h"
-#endif
 
 class CarfacFrontend {
 public:
     struct Params {
-        int sample_rate = 44100;
-        int num_channels = 16; // number of cochlear channels (bands)
+        int sample_rate = 44100;       // Input sample rate (Bela audio rate)
+        int carfac_rate = 0;           // CARFAC processing rate (0 = same as sample_rate)
         bool enable_agc = true;
         int publish_hop = 256; // frames per publish
         // Envelope timing (seconds); used by the wrapper for fast/slow AR
@@ -72,20 +70,21 @@ private:
     };
 
     // Config
-    int fs_ = 44100;
+    int fs_ = 44100;         // Input sample rate
+    int carfac_fs_ = 44100;  // CARFAC internal rate
+    int decim_ = 1;          // Decimation factor (fs_ / carfac_fs_)
+    int decim_cnt_ = 0;      // Decimation counter
+    float aa_state_ = 0.0f;  // Anti-aliasing filter state
+    float aa_coeff_ = 0.0f;  // Anti-aliasing filter coefficient
     int bands_ = 0;
     int hop_ = 256;
     bool agc_ = true;
 
-    // Internal per-band states (for the stub and envelope publish)
-    std::vector<float> band_sig_;   // latest per-band sample (from CAR/IHC)
-    std::vector<float> band_gain_;  // optional per-band gain (AGC)
+    // Internal per-band states
+    std::vector<float> band_sig_;
+    std::vector<float> band_gain_;
     std::vector<AR> fast_, slow_;
 
-#ifdef HAVE_CARFAC
     std::unique_ptr<CARFAC> carfac_;
-    std::vector<float> buffer_;
-#else
-    std::vector<float> buffer_;
-#endif
+    Ear* ear_ = nullptr;  // Cached pointer to mutable ear (avoids repeated lookups)
 };

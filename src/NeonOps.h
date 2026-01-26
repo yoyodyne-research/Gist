@@ -13,6 +13,23 @@
 
 namespace gist_neon {
 
+// ARMv7 doesn't have vsqrtq_f32, so we use reciprocal sqrt estimate + Newton-Raphson
+inline float32x4_t neon_sqrt_f32(float32x4_t x)
+{
+    // rsqrt estimate: y = vrsqrteq_f32(x)
+    // Newton-Raphson: y = y * (3 - x * y * y) / 2
+    // sqrt(x) = x * rsqrt(x)
+    float32x4_t recip = vrsqrteq_f32(x);
+    // One iteration of Newton-Raphson refinement
+    recip = vmulq_f32(recip, vrsqrtsq_f32(vmulq_f32(x, recip), recip));
+    // sqrt = x * rsqrt(x), but guard against zero
+    float32x4_t zero = vdupq_n_f32(0.0f);
+    float32x4_t result = vmulq_f32(x, recip);
+    // Select zero where x is zero to avoid NaN
+    uint32x4_t mask = vceqq_f32(x, zero);
+    return vbslq_f32(mask, zero, result);
+}
+
 // Compute magnitude spectrum: mag[i] = sqrt(r[i]^2 + i[i]^2)
 // n must be the number of bins (e.g., frameSize/2)
 inline void magnitude_f32(const float* r, const float* im, float* mag, std::size_t n)
@@ -26,7 +43,7 @@ inline void magnitude_f32(const float* r, const float* im, float* mag, std::size
         float32x4_t rr  = vmulq_f32(vr, vr);
         float32x4_t ii  = vmulq_f32(vi, vi);
         float32x4_t sum = vaddq_f32(rr, ii);
-        float32x4_t ms  = vsqrtq_f32(sum);
+        float32x4_t ms  = neon_sqrt_f32(sum);
         vst1q_f32(mag + i, ms);
     }
     for (; i < n; ++i)

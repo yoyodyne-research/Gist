@@ -51,7 +51,13 @@ public:
     float lastPeriodicity() const { return lastPeriodicity_; }
 
 private:
-    struct Edge { float peak = 0.f; int lead = -1; int trail = -1; };
+    struct Edge {
+        float peak;
+        int lead;
+        int trail;
+        Edge() : peak(0.f), lead(-1), trail(-1) {}
+        Edge(float p, int l, int t) : peak(p), lead(l), trail(t) {}
+    };
 
     // State
     int fs = 44100;

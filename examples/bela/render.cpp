@@ -4,19 +4,43 @@
 #include <cstring>
 #include <atomic>
 #include <memory>
-#include "Gist.h"
-#include "pffft.h" // for runtime SIMD check
-#include "carfac_frontend.h"
+
+// Feature extraction method toggles (set via CPPFLAGS or settings.json)
+#if !defined(ENABLE_CARFAC)
+#define ENABLE_CARFAC 1
+#endif
+#if !defined(ENABLE_GIST_SPECTRAL)
+#define ENABLE_GIST_SPECTRAL 0
+#endif
+#if !defined(ENABLE_GIST_RMS)
+#define ENABLE_GIST_RMS 0
+#endif
+#if !defined(ENABLE_PITCH)
+#define ENABLE_PITCH 0
+#endif
+#if !defined(ENABLE_MFCC)
+#define ENABLE_MFCC 0
+#endif
 #if !defined(ENABLE_SCOPE)
-#define ENABLE_SCOPE 1
+#define ENABLE_SCOPE 0
+#endif
+#if !defined(CARFAC_RATE)
+#define CARFAC_RATE 0  // 0 = same as audio rate; set to e.g. 22050 for half-rate
+#endif
+
+// Conditional includes
+#if ENABLE_GIST_SPECTRAL || ENABLE_GIST_RMS || ENABLE_PITCH || ENABLE_MFCC
+#include "Gist.h"
+#include "pffft.h"
+#endif
+#if ENABLE_CARFAC
+#include "carfac_frontend.h"
 #endif
 #if ENABLE_SCOPE
 #include <libraries/Scope/Scope.h>
-#else
-#warning "Scope is DISABLED"
 #endif
 
-#ifdef USE_BITSTREAM_PITCH
+#if ENABLE_PITCH && defined(USE_BITSTREAM_PITCH)
 // Compile-time tunables for bitstream pitch presets
 #ifndef PITCH_MIN_HZ
 #define PITCH_MIN_HZ 40.0f     // bass low B ≈ 30.87 Hz; 4-string low E ≈ 41.2 Hz
@@ -64,96 +88,60 @@ static inline void applyPitchPreset(Gist<float>& gist)
 #endif
 
 // Configuration
-static constexpr int kFrameSize = 256;   // analysis window size
-static constexpr int kHopSize   = 64;    // tighter responsiveness, keep CPU modest
-
-#if ENABLE_SCOPE
-// Scope visualization: select 6 bands spanning the frequency range
-static constexpr int kScopeBands[] = {0, 3, 6, 9, 12, 15};
-static constexpr int kNumScopeBands = 6;
+#if ENABLE_GIST_SPECTRAL || ENABLE_GIST_RMS || ENABLE_PITCH || ENABLE_CARFAC
+static constexpr int kHopSize   = 64;    // hop size for frame-based processing
 #endif
 
-// Analysis
+#if ENABLE_SCOPE
+static int gNumScopeBands = 0;  // Set dynamically from CARFAC band count
+static std::vector<float> gScopeBuffer;  // Buffer for scope logging
+#endif
+
+// Analysis objects
+#if ENABLE_GIST_SPECTRAL || ENABLE_GIST_RMS
 static std::unique_ptr<Gist<float>> gGist;
+#endif
+#if ENABLE_PITCH
 static std::unique_ptr<Gist<float>> gGistPitch;  // separate instance for aux pitch
-static std::unique_ptr<CarfacFrontend> gCarfac;  // CARFAC cochlear frontend
-#if ENABLE_SCOPE
-static Scope gScope;                             // Bela oscilloscope for visualization
-#endif
-static std::vector<float> gRing;            // circular buffer of last kFrameSize samples
-static std::vector<float> gFrame;           // contiguous copy (time-domain)
-static std::vector<float> gPitchFrame;      // frame handed to aux pitch task
-// Optionally compute MFCCs in aux task. Disable at compile time by defining
-// ENABLE_MFCC=0 in settings.json (defines/cflags/cxxflags). When disabled,
-// no MFCC work is done at runtime.
-#if !defined(ENABLE_MFCC)
-#define ENABLE_MFCC 0
-#endif
-#if ENABLE_MFCC
-static std::vector<float> gMfcc;            // latest MFCCs (size ~13)
-#endif
-static std::vector<float> gEnvFast, gEnvSlow, gTransient; // multiband outputs
-static int gFlenserDecim = 0;
-static int gWriteIdx = 0;
-static int gSamplesSinceHop = 0;
+static std::vector<float> gPitchFrame;           // frame handed to aux pitch task
 static AuxiliaryTask gPitchTask;
 static std::atomic<bool> gPitchPending{false};
+static std::atomic<float> gPitchHz{0.f};
+static int gPitchDecim = 0;
+#endif
+#if ENABLE_CARFAC
+static std::unique_ptr<CarfacFrontend> gCarfac;
+static std::vector<float> gEnvFast, gEnvSlow, gTransient;
+static int gCarfacDecim = 0;
+#endif
+#if ENABLE_SCOPE
+static Scope gScope;
+#endif
+#if ENABLE_MFCC
+static std::vector<float> gMfcc;
+#endif
 
-// Window configured inside Gist; no windowing needed here when using processAudioFrame()
+// Shared state for frame-based processing
+#if ENABLE_GIST_SPECTRAL || ENABLE_GIST_RMS || ENABLE_PITCH
+static std::vector<float> gRing;
+static std::vector<float> gFrame;
+static int gWriteIdx = 0;
+static int gSamplesSinceHop = 0;
+#endif
 
 // Outputs (read from non-RT contexts if needed)
+#if ENABLE_GIST_RMS
 static std::atomic<float> gRms{0.f};
+#endif
+#if ENABLE_GIST_SPECTRAL
 static std::atomic<float> gCentroid{0.f};
 static std::atomic<float> gRolloff{0.f};
 static std::atomic<float> gHfc{0.f};
-static std::atomic<float> gPitchHz{0.f};
-static int gPitchDecim = 0;              // throttle expensive YIN calls
+#endif
 
 bool setup(BelaContext* context, void* userData)
 {
     const int fs = context->audioSampleRate;
-    gGist.reset(new Gist<float>(kFrameSize, fs, HanningWindow));
-    gGistPitch.reset(new Gist<float>(kFrameSize, fs, HanningWindow));
-    gCarfac.reset(new CarfacFrontend());
-    #ifdef USE_BITSTREAM_PITCH
-    // Apply preset or custom values via compile-time macros. Override in IDE:
-    //  -DPITCH_PRESET=6 (GUITAR), 2 (BASS4), 1 (BASS6), etc.
-    // Or set custom: -DPITCH_MIN_HZ=80.0f -DPITCH_HYST=0.02f
-    applyPitchPreset(*gGistPitch);
-    #endif
-
-    gRing.assign(kFrameSize, 0.0f);
-    gFrame.assign(kFrameSize, 0.0f);
-    gPitchFrame.assign(kFrameSize, 0.0f);
-#if ENABLE_MFCC
-    gMfcc.assign(13, 0.0f);
-#endif
-    // Configure CARFAC cochlear frontend
-    {
-        CarfacFrontend::Params cp;
-        cp.sample_rate = fs;
-        cp.num_channels = 16;
-        cp.enable_agc = true;
-        cp.publish_hop = kHopSize * 4; // align with our spec cadence (~256)
-        gCarfac->init(cp);
-        const size_t bands = gCarfac->numBands();
-        gEnvFast.assign(bands, 0.0f);
-        gEnvSlow.assign(bands, 0.0f);
-        gTransient.assign(bands, 0.0f);
-        rt_printf("CARFAC bands=%zu\n", bands);
-    }
-#if ENABLE_SCOPE
-    // Initialize Bela Scope for visualizing CARFAC band envelopes
-    gScope.setup(kNumScopeBands, fs);
-    rt_printf("Scope: %d CARFAC bands -> channels\n", kNumScopeBands);
-#endif
-
-    gWriteIdx = 0;
-    gSamplesSinceHop = 0;
-
-    // Log frontend + SIMD backend (non-RT context)
-    rt_printf("Frontend: CARFAC\n");
-    rt_printf("PFFFT SIMD: %s (size=%d)\n", pffft_simd_arch(), pffft_simd_size());
 
     // Enable flush-to-zero and denormals-are-zero (avoid rare CPU spikes)
     {
@@ -163,35 +151,87 @@ bool setup(BelaContext* context, void* userData)
         asm volatile ("vmsr fpscr, %0" :: "r" (fpscr));
     }
 
+#if ENABLE_GIST_SPECTRAL || ENABLE_GIST_RMS
+    gGist.reset(new Gist<float>(kFrameSize, fs, HanningWindow));
+    rt_printf("Gist: spectral=%d rms=%d\n", ENABLE_GIST_SPECTRAL, ENABLE_GIST_RMS);
+#endif
+
+#if ENABLE_PITCH
+    gGistPitch.reset(new Gist<float>(kFrameSize, fs, HanningWindow));
+    gPitchFrame.assign(kFrameSize, 0.0f);
+#if defined(USE_BITSTREAM_PITCH)
+    applyPitchPreset(*gGistPitch);
+#endif
     gPitchTask = Bela_createAuxiliaryTask([](void*) {
         if (!gPitchPending.load(std::memory_order_acquire))
             return;
-        // Compute pitch on separate instance to avoid contention
         gGistPitch->processAudioFrame(gPitchFrame.data(), kFrameSize);
-        #ifdef USE_BITSTREAM_PITCH
+#if defined(USE_BITSTREAM_PITCH)
         gPitchHz.store(gGistPitch->pitchFast(), std::memory_order_relaxed);
-        #else
+#else
         gPitchHz.store(gGistPitch->pitch(), std::memory_order_relaxed);
-        #endif
-        #if ENABLE_MFCC
-        // Compute MFCCs on the aux instance and copy out
+#endif
+#if ENABLE_MFCC
         const auto& mfcc = gGistPitch->getMelFrequencyCepstralCoefficients();
         const size_t n = std::min(gMfcc.size(), mfcc.size());
         if (n)
             std::memcpy(gMfcc.data(), mfcc.data(), n * sizeof(float));
-        #endif
+#endif
         gPitchPending.store(false, std::memory_order_release);
     }, 50, "gist-pitch-task", nullptr);
+    rt_printf("Pitch: enabled\n");
+#endif
+
+#if ENABLE_MFCC
+    gMfcc.assign(13, 0.0f);
+    rt_printf("MFCC: enabled\n");
+#endif
+
+#if ENABLE_GIST_SPECTRAL || ENABLE_GIST_RMS || ENABLE_PITCH
+    gRing.assign(kFrameSize, 0.0f);
+    gFrame.assign(kFrameSize, 0.0f);
+    gWriteIdx = 0;
+    gSamplesSinceHop = 0;
+#endif
+
+#if ENABLE_CARFAC
+    gCarfac.reset(new CarfacFrontend());
+    {
+        CarfacFrontend::Params cp;
+        cp.sample_rate = fs;
+        cp.carfac_rate = CARFAC_RATE;  // 0 = full rate, else decimated
+        cp.enable_agc = true;
+        cp.publish_hop = kHopSize * 4;
+        gCarfac->init(cp);
+        rt_printf("CARFAC rate: %d Hz (input: %d Hz, decim: %dx)\n",
+                  cp.carfac_rate ? cp.carfac_rate : fs, fs,
+                  cp.carfac_rate ? (fs / cp.carfac_rate) : 1);
+        const size_t bands = gCarfac->numBands();
+        gEnvFast.assign(bands, 0.0f);
+        gEnvSlow.assign(bands, 0.0f);
+        gTransient.assign(bands, 0.0f);
+        rt_printf("CARFAC: %zu bands\n", bands);
+    }
+#endif
+
+#if ENABLE_SCOPE && ENABLE_CARFAC
+    gNumScopeBands = gCarfac->numBands();
+    gScopeBuffer.resize(gNumScopeBands);
+    gScope.setup(gNumScopeBands, fs);
+    rt_printf("Scope: %d CARFAC bands -> channels\n", gNumScopeBands);
+#endif
+
     return true;
 }
 
+#if ENABLE_GIST_SPECTRAL || ENABLE_GIST_RMS || ENABLE_PITCH
 static inline void extractFrameContiguous()
 {
-    // Copy ring -> contiguous frame in time order [oldest..newest)
     const int tail = kFrameSize - gWriteIdx;
-    std::memcpy(gFrame.data(),            gRing.data() + gWriteIdx, tail * sizeof(float));
-    std::memcpy(gFrame.data() + tail,     gRing.data(),             gWriteIdx * sizeof(float));
+    std::memcpy(gFrame.data(),        gRing.data() + gWriteIdx, tail * sizeof(float));
+    std::memcpy(gFrame.data() + tail, gRing.data(),             gWriteIdx * sizeof(float));
 }
+#endif
 
 void render(BelaContext* context, void* userData)
 {
@@ -202,59 +242,79 @@ void render(BelaContext* context, void* userData)
         // Mono input (ch 1 = right). Replace with whatever input you use.
         float x = audioRead(context, n, 1);
 
-        // Push to ring buffer
+#if ENABLE_GIST_SPECTRAL || ENABLE_GIST_RMS || ENABLE_PITCH
+        // Push to ring buffer for frame-based processing
         gRing[gWriteIdx] = x;
         gWriteIdx = (gWriteIdx + 1) % kFrameSize;
         gSamplesSinceHop++;
-
-        // CARFAC cochlear processing per-sample
-        gCarfac->processSample(x);
-
-#if ENABLE_SCOPE
-        // Log selected CARFAC bands to scope (per-sample envelope values)
-        gScope.log(gCarfac->getEnvFast(kScopeBands[0]), gCarfac->getEnvFast(kScopeBands[1]),
-                   gCarfac->getEnvFast(kScopeBands[2]), gCarfac->getEnvFast(kScopeBands[3]),
-                   gCarfac->getEnvFast(kScopeBands[4]), gCarfac->getEnvFast(kScopeBands[5]));
 #endif
 
+#if ENABLE_CARFAC
+        // CARFAC cochlear processing per-sample
+        gCarfac->processSample(x);
+#endif
+
+#if ENABLE_SCOPE && ENABLE_CARFAC
+        // Log all CARFAC bands to scope (per-sample envelope values)
+        for (int b = 0; b < gNumScopeBands; ++b) {
+            gScopeBuffer[b] = gCarfac->getEnvFast(b);
+        }
+        gScope.log(gScopeBuffer.data());
+#endif
+
+#if ENABLE_GIST_SPECTRAL || ENABLE_GIST_RMS || ENABLE_PITCH
         if (gSamplesSinceHop >= kHopSize)
         {
             gSamplesSinceHop -= kHopSize;
-
-            // Build a contiguous frame and process (Gist applies window internally)
             extractFrameContiguous();
-            gGist->processAudioFrame(gFrame.data(), kFrameSize);
 
-            // Frequency-domain features (lightweight; still, compute every other hop if needed)
+#if ENABLE_GIST_SPECTRAL || ENABLE_GIST_RMS
+            gGist->processAudioFrame(gFrame.data(), kFrameSize);
+#endif
+
+#if ENABLE_GIST_SPECTRAL
             static int specDecim = 0;
-            if ((specDecim++ & 0x3) == 0) { // every 4 hops
+            if ((specDecim++ & 0x3) == 0) {
                 gCentroid.store(gGist->spectralCentroid(), std::memory_order_relaxed);
                 gRolloff.store(gGist->spectralRolloff(), std::memory_order_relaxed);
                 gHfc.store(gGist->highFrequencyContent(), std::memory_order_relaxed);
-
-                // MFCCs moved to aux task to reduce RT load
             }
+#endif
 
-            // Time-domain + pitch (pitch is heavy; offload to aux task)
+#if ENABLE_GIST_RMS
             gRms.store(gGist->rootMeanSquare(), std::memory_order_relaxed);
-            if ((gPitchDecim++ & 0x3) == 0) { // schedule every 4 hops
+#endif
+
+#if ENABLE_PITCH
+            if ((gPitchDecim++ & 0x3) == 0) {
                 if (!gPitchPending.load(std::memory_order_acquire)) {
-                    // hand over a copy of the current frame to the aux task
                     std::memcpy(gPitchFrame.data(), gFrame.data(), kFrameSize * sizeof(float));
                     gPitchPending.store(true, std::memory_order_release);
                     Bela_scheduleAuxiliaryTask(gPitchTask);
                 }
             }
-
-            // Decimate and publish CARFAC envelopes (every 256 samples)
-            if ((gFlenserDecim++ & 0x3) == 0) {
-                gCarfac->publish(gEnvFast, gEnvSlow, gTransient, nullptr);
-            }
+#endif
         }
+#endif
+
+#if ENABLE_CARFAC
+        // Publish CARFAC envelopes periodically
+        if ((gCarfacDecim++ & 0xFF) == 0) {
+            gCarfac->publish(gEnvFast, gEnvSlow, gTransient, nullptr);
+        }
+#endif
     }
 }
 
 void cleanup(BelaContext* context, void* userData)
 {
+#if ENABLE_GIST_SPECTRAL || ENABLE_GIST_RMS
     gGist.reset();
+#endif
+#if ENABLE_PITCH
+    gGistPitch.reset();
+#endif
+#if ENABLE_CARFAC
+    gCarfac.reset();
+#endif
 }
