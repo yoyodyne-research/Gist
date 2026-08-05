@@ -92,19 +92,98 @@ void CarfacFrontend::processSample(float x)
 
 void CarfacFrontend::publish(std::vector<float>& env_fast,
                              std::vector<float>& env_slow,
-                             std::vector<float>& transient,
+                             std::vector<float>& delta,
                              std::vector<float>* opt_gain)
 {
     // Just copy current envelope state (processing already done in processSample)
     env_fast.resize(bands_);
     env_slow.resize(bands_);
-    transient.resize(bands_);
+    delta.resize(bands_);
     if (opt_gain) opt_gain->assign(bands_, 1.0f);
 
     for (int b = 0; b < bands_; ++b) {
         env_fast[b] = fast_[b].env;
         env_slow[b] = slow_[b].env;
-        float tval = fast_[b].env - slow_[b].env;
-        transient[b] = (tval > 0.f ? tval : 0.f);
+        // Signed delta: positive = attack (energy rising), negative = decay (energy falling)
+        delta[b] = fast_[b].env - slow_[b].env;
     }
+}
+
+void CarfacFrontend::publishFeatures(LatentInput& out)
+{
+    // Band boundaries for low/mid/high energy ratios
+    // 71 bands split roughly into thirds: 0-23 (low), 24-47 (mid), 48-70 (high)
+    constexpr int kLowEnd = 24;
+    constexpr int kMidEnd = 48;
+    constexpr float kAttackThreshold = 0.01f;  // Delta threshold for attack detection
+
+    float total_energy = 0.0f;
+    float weighted_sum = 0.0f;
+    float low_energy = 0.0f;
+    float mid_energy = 0.0f;
+    float high_energy = 0.0f;
+    float max_env = 0.0f;
+    int peak_band = 0;
+    int attack_count = 0;
+
+    // First pass: collect env_fast, delta, and accumulate statistics
+    for (int b = 0; b < bands_ && b < LatentInput::kNumBands; ++b) {
+        float env = fast_[b].env;
+        float d = fast_[b].env - slow_[b].env;
+
+        out.env_fast[b] = env;
+        out.delta[b] = d;
+
+        total_energy += env;
+        weighted_sum += static_cast<float>(b) * env;
+
+        if (env > max_env) {
+            max_env = env;
+            peak_band = b;
+        }
+
+        if (d > kAttackThreshold)
+            attack_count++;
+
+        // Accumulate band energies
+        if (b < kLowEnd)
+            low_energy += env;
+        else if (b < kMidEnd)
+            mid_energy += env;
+        else
+            high_energy += env;
+    }
+
+    // Zero-pad if CARFAC has fewer than 71 bands
+    for (int b = bands_; b < LatentInput::kNumBands; ++b) {
+        out.env_fast[b] = 0.0f;
+        out.delta[b] = 0.0f;
+    }
+
+    // Compute summary statistics
+    out.total_energy = total_energy;
+
+    // Spectral centroid: weighted average of band indices
+    out.spectral_centroid = (total_energy > 1e-10f)
+        ? weighted_sum / total_energy
+        : static_cast<float>(bands_) / 2.0f;
+
+    // Spectral spread: standard deviation around centroid
+    float variance_sum = 0.0f;
+    for (int b = 0; b < bands_ && b < LatentInput::kNumBands; ++b) {
+        float diff = static_cast<float>(b) - out.spectral_centroid;
+        variance_sum += diff * diff * out.env_fast[b];
+    }
+    out.spectral_spread = (total_energy > 1e-10f)
+        ? std::sqrt(variance_sum / total_energy)
+        : 0.0f;
+
+    out.peak_band = static_cast<float>(peak_band);
+    out.attack_breadth = static_cast<float>(attack_count);
+
+    // Band ratios (normalized by total energy)
+    float inv_total = (total_energy > 1e-10f) ? 1.0f / total_energy : 0.0f;
+    out.band_ratios[0] = low_energy * inv_total;
+    out.band_ratios[1] = mid_energy * inv_total;
+    out.band_ratios[2] = high_energy * inv_total;
 }

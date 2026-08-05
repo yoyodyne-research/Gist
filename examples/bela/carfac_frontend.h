@@ -3,7 +3,14 @@
 // This is a thin adapter around the CARFAC (cochlear) library that:
 // - Initializes CAR, IHC, and AGC subsystems for a mono input
 // - Processes samples inline via per-sample API (spreads CPU load evenly)
-// - Publishes per-band envelopes (fast/slow) and a transient metric
+// - Publishes per-band envelopes (fast/slow) and delta (signed derivative)
+//
+// Output signals per band:
+//   env_fast: Fast envelope (tracks energy with quick attack/release)
+//   env_slow: Slow envelope (tracks "background" energy level)
+//   delta:    Signed difference (fast - slow); positive = attack, negative = decay
+//
+// With env_fast + delta, env_slow can be recovered: env_slow = env_fast - delta
 //
 // Requires HAVE_CARFAC to be defined and CARFAC sources to be linked.
 
@@ -14,11 +21,13 @@
 #endif
 
 #include <vector>
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <memory>
 
 #include "carfac/upstream/cpp/carfac.h"
+#include "latent_input.h"
 
 class CarfacFrontend {
 public:
@@ -45,8 +54,11 @@ public:
     // Called at hop boundary to copy out latest features
     void publish(std::vector<float>& env_fast,
                  std::vector<float>& env_slow,
-                 std::vector<float>& transient,
+                 std::vector<float>& delta,
                  std::vector<float>* opt_gain = nullptr);
+
+    // Publish features for latent layer (env_fast + delta + summary stats)
+    void publishFeatures(LatentInput& out);
 
     int numBands() const { return bands_; }
 

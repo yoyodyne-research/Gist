@@ -1,0 +1,14 @@
+diff --git a/cpp/carfac.h b/cpp/carfac.h
+index 90ee3f7..d2b4ceb 100644
+--- a/cpp/carfac.h
++++ b/cpp/carfac.h
+@@ -79,6 +79,9 @@ class CARFAC {
+   // Access Ears for testing.
+   const Ear& get_ear(int ear_index) const { return *(ears_[ear_index]); }
+ 
++  // Mutable access for direct per-sample processing (avoids RunSegment overhead).
++  Ear* mutable_ear(int ear_index) { return ears_[ear_index]; }
++
+  private:
+   static void DesignCARCoeffs(const CARParams& car_params, FPType sample_rate,
+                               const ArrayX& pole_freqs, CARCoeffs* car_coeffs);

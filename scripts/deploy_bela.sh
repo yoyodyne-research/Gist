@@ -14,7 +14,9 @@ set -euo pipefail
 
 RUN_PROJECT=false
 USE_SCOPE=false
+USE_LATENT=false
 CARFAC_RATE=0  # 0 = same as audio rate
+LATENT_MODEL=""  # Path to latent_model.json
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -26,13 +28,22 @@ while [[ $# -gt 0 ]]; do
             USE_SCOPE=true
             shift
             ;;
+        --latent|--use-latent|--use_latent)
+            USE_LATENT=true
+            shift
+            ;;
+        --latent-model)
+            LATENT_MODEL="$2"
+            USE_LATENT=true
+            shift 2
+            ;;
         --carfac-rate|--carfac_rate)
             CARFAC_RATE="$2"
             shift 2
             ;;
         *)
             echo "Unknown option: $1" >&2
-            echo "Usage: $0 [--run|-r] [--scope] [--carfac-rate RATE]" >&2
+            echo "Usage: $0 [--run|-r] [--scope] [--latent] [--latent-model PATH] [--carfac-rate RATE]" >&2
             exit 1
             ;;
     esac
@@ -60,6 +71,21 @@ cp -v "$REPO_ROOT/examples/bela/settings.json" "$LOCAL_PROJECT/"
 cp -v "$REPO_ROOT/examples/bela/carfac_frontend.h" "$LOCAL_PROJECT/"
 cp -v "$REPO_ROOT/examples/bela/carfac_frontend.cpp" "$LOCAL_PROJECT/"
 cp -v "$REPO_ROOT/examples/bela/pffft_alloc.c" "$LOCAL_PROJECT/"
+
+# Copy latent layer files (if enabled)
+if $USE_LATENT; then
+    cp -v "$REPO_ROOT/examples/bela/latent_layer.h" "$LOCAL_PROJECT/"
+    cp -v "$REPO_ROOT/examples/bela/latent_layer.cpp" "$LOCAL_PROJECT/"
+    echo "Latent layer: ENABLED"
+
+    # Copy latent model if specified
+    if [ -n "$LATENT_MODEL" ] && [ -f "$LATENT_MODEL" ]; then
+        cp -v "$LATENT_MODEL" "$LOCAL_PROJECT/latent_model.json"
+        echo "Latent model: $LATENT_MODEL"
+    else
+        echo "Warning: No latent model specified. Use --latent-model PATH to include trained model."
+    fi
+fi
 
 # Copy Gist sources (avoid Apple Accelerate files)
 cp -v "$REPO_ROOT/src/Gist.cpp" "$LOCAL_PROJECT/"
@@ -193,6 +219,11 @@ if $USE_SCOPE; then
 else
     echo "Bela Scope: disabled (use --scope to enable)"
 fi
+if $USE_LATENT; then
+    echo "Latent layer: ENABLED (--latent flag)"
+else
+    echo "Latent layer: disabled (use --latent to enable)"
+fi
 if [[ "$CARFAC_RATE" -gt 0 ]]; then
     echo "CARFAC rate: ${CARFAC_RATE} Hz (decimated)"
 else
@@ -210,7 +241,14 @@ else
     SCOPE_FLAG="-DENABLE_SCOPE=0"
 fi
 
-BELA_CPPFLAGS="-DUSE_PFFFT -DUSE_ARM_NEON -DPFFFT_ENABLE_NEON -D__ARM_NEON -D__arm__ -DUSE_BITSTREAM_PITCH -DPITCH_PRESET=6 -DENABLE_MFCC=0 $SCOPE_FLAG -DCARFAC_RATE=$CARFAC_RATE -DHAVE_CARFAC -DPFFFT_SILENCE_SIMD_MSG -DEIGEN_DONT_PARALLELIZE -DEIGEN_NO_DEBUG -DEIGEN_MALLOC_ALREADY_ALIGNED=0"
+# Set ENABLE_LATENT based on --latent flag
+if $USE_LATENT; then
+    LATENT_FLAG="-DENABLE_LATENT=1"
+else
+    LATENT_FLAG="-DENABLE_LATENT=0"
+fi
+
+BELA_CPPFLAGS="-DUSE_PFFFT -DUSE_ARM_NEON -DPFFFT_ENABLE_NEON -D__ARM_NEON -D__arm__ -DUSE_BITSTREAM_PITCH -DPITCH_PRESET=6 -DENABLE_MFCC=0 $SCOPE_FLAG $LATENT_FLAG -DCARFAC_RATE=$CARFAC_RATE -DHAVE_CARFAC -DPFFFT_SILENCE_SIMD_MSG -DEIGEN_DONT_PARALLELIZE -DEIGEN_NO_DEBUG -DEIGEN_MALLOC_ALREADY_ALIGNED=0"
 BELA_CFLAGS="-march=armv7-a -O3 -ffast-math -fno-math-errno -ftree-vectorize -Wno-#pragma-messages -mfpu=neon-vfpv3 -mcpu=cortex-a8 -mfloat-abi=hard"
 BELA_CXXFLAGS="-std=c++11 $BELA_CFLAGS"
 BELA_INCLUDES="-I. -Ipffft -Ipffft/simd -Icarfac -Icarfac/upstream -Icarfac/upstream/cpp -Icarfac/eigen"

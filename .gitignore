@@ -6,3 +6,16 @@ max-externals/project/Build
 *.xccheckout
 build/
 .bela_project/
+
+# Tool caches
+.serena/
+__pycache__/
+*.pyc
+
+# Reference papers (see docs/REFERENCES.md for URLs)
+docs/*.pdf
+
+# Generated test artifacts (parity tests, random-data models)
+/test_latent_model.json
+/test_reference*
+/tmp/
