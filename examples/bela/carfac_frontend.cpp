@@ -14,6 +14,7 @@ bool CarfacFrontend::init(const Params& p)
     fs_ = p.sample_rate;
     hop_ = p.publish_hop;
     agc_ = p.enable_agc;
+    env_from_ihc_ = p.env_from_ihc;
     if (fs_ <= 0) return false;
 
     // Compute decimation factor (CARFAC runs at reduced rate if carfac_rate specified)
@@ -37,8 +38,9 @@ bool CarfacFrontend::init(const Params& p)
 
     // Build CAR/IHC/AGC params; CARFAC will design coeffs and allocate state.
     CARParams carp; IHCParams ihcp; AGCParams agcp;
-    // erb_per_step = 1.0 (default) for full resolution; higher values reduce bands
-    ihcp.just_half_wave_rectify = true;  // Bypass expensive cube/divide nonlinearity
+    if (p.erb_per_step > 0.0f) carp.erb_per_step = p.erb_per_step;  // larger = fewer bands
+    // Half-wave rectification bypasses the cube/divide nonlinearity and capacitor adaptation (Bela CPU)
+    ihcp.just_half_wave_rectify = !p.full_ihc;
     const int num_ears = 1;
     carfac_.reset(new CARFAC(num_ears, static_cast<FPType>(carfac_fs_), carp, ihcp, agcp));
     carfac_->Reset();
@@ -76,15 +78,14 @@ void CarfacFrontend::processSample(float x)
     // Run CARFAC pipeline at reduced rate
     ear_->CARStep(static_cast<FPType>(aa_state_));
     ear_->IHCStep(ear_->car_out());
-    bool agc_updated = ear_->AGCStep(ear_->ihc_out());
-    if (agc_updated) {
+    if (agc_ && ear_->AGCStep(ear_->ihc_out())) {
         ear_->CloseAGCLoop(false);
     }
 
     // Update envelope followers (at CARFAC rate)
-    const ArrayX& bm = ear_->zy_memory();
+    const ArrayX& src = env_from_ihc_ ? ear_->ihc_out() : ear_->zy_memory();
     for (int b = 0; b < bands_; ++b) {
-        float a = std::fabs(static_cast<float>(bm(b)));
+        float a = std::fabs(static_cast<float>(src(b)));
         fast_[b].step(a);
         slow_[b].step(a);
     }

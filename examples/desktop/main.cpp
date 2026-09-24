@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 
 #include "carfac_frontend.h"
 #include "latent_layer.h"
@@ -44,7 +46,8 @@ bool loadWav(const char* path, std::vector<float>& samples, int& sample_rate) {
         return false;
     }
 
-    // Skip to data chunk
+    // Skip to data chunk (the fmt chunk may be longer than the 16 bytes in WavHeader)
+    file.seekg(20 + header.fmt_size, std::ios::beg);
     char chunk_id[4];
     uint32_t chunk_size;
     while (file.read(chunk_id, 4) && file.read(reinterpret_cast<char*>(&chunk_size), 4)) {
@@ -114,6 +117,8 @@ struct ReferenceData {
 void printUsage(const char* prog) {
     std::cerr << "Usage: " << prog << " <command> [options]\n"
               << "\nCommands:\n"
+              << "  features <audio.wav> <out_prefix> [options]\n"
+              << "      Dump per-band CARFAC envelopes (high fidelity by default)\n"
               << "  process <audio.wav> <model.json> [output.csv]\n"
               << "      Process audio file through CARFAC + latent layer\n"
               << "      Outputs latent signals to stdout or file\n"
@@ -222,6 +227,93 @@ int cmdProcess(int argc, char** argv) {
     }
 
     std::cerr << "Processed " << frame_count << " frames" << std::endl;
+    return 0;
+}
+
+// Dump raw per-band CARFAC envelopes for offline analysis.
+// Writes <prefix>.f32 (float32, frames x 3 x bands: env_fast, env_slow, delta) and <prefix>.json.
+int cmdFeatures(int argc, char** argv) {
+    if (argc < 4) {
+        std::cerr << "Usage: " << argv[0] << " features <audio.wav> <out_prefix> [--bela] [--hop N]\n"
+                  << "       [--carfac-rate HZ] [--erb-per-step X] [--ihc full|hwr] [--env ihc|bm] [--agc on|off]\n"
+                  << "  Defaults are high fidelity (upstream CARFAC at the file's rate); --bela starts from the\n"
+                  << "  Bela budget settings instead. Later options override either.\n";
+        return 1;
+    }
+    const char* audio_path = argv[2];
+    const std::string prefix = argv[3];
+
+    std::vector<float> audio;
+    int sample_rate;
+    if (!loadWav(audio_path, audio, sample_rate)) return 1;
+
+    CarfacFrontend::Params params = CarfacFrontend::Params::highFidelity(sample_rate);
+    params.publish_hop = 256;
+    for (int i = 4; i < argc; ++i) {
+        std::string a = argv[i];
+        auto next = [&]() -> std::string {
+            if (i + 1 >= argc) { std::cerr << "Missing value for " << a << "\n"; std::exit(1); }
+            return argv[++i];
+        };
+        if (a == "--bela") {
+            CarfacFrontend::Params b;
+            b.sample_rate = sample_rate;
+            b.carfac_rate = 22050;
+            b.publish_hop = params.publish_hop;
+            params = b;
+        }
+        else if (a == "--hop") params.publish_hop = std::stoi(next());
+        else if (a == "--carfac-rate") params.carfac_rate = std::stoi(next());
+        else if (a == "--erb-per-step") params.erb_per_step = std::stof(next());
+        else if (a == "--ihc") params.full_ihc = next() == "full";
+        else if (a == "--env") params.env_from_ihc = next() == "ihc";
+        else if (a == "--agc") params.enable_agc = next() == "on";
+        else { std::cerr << "Unknown option " << a << "\n"; return 1; }
+    }
+
+    CarfacFrontend carfac;
+    if (!carfac.init(params)) {
+        std::cerr << "Failed to initialize CARFAC" << std::endl;
+        return 1;
+    }
+    const int bands = carfac.numBands();
+
+    std::ofstream bin(prefix + ".f32", std::ios::binary);
+    std::vector<float> env_fast, env_slow, delta;
+    long frames = 0;
+    int count = 0;
+    for (float x : audio) {
+        carfac.processSample(x);
+        if (++count >= params.publish_hop) {
+            count = 0;
+            carfac.publish(env_fast, env_slow, delta);
+            bin.write(reinterpret_cast<const char*>(env_fast.data()), bands * sizeof(float));
+            bin.write(reinterpret_cast<const char*>(env_slow.data()), bands * sizeof(float));
+            bin.write(reinterpret_cast<const char*>(delta.data()), bands * sizeof(float));
+            ++frames;
+        }
+    }
+
+    std::ofstream meta(prefix + ".json");
+    meta << "{\n  \"source\": \"" << audio_path << "\",\n"
+         << "  \"layout\": [\"frames\", [\"env_fast\", \"env_slow\", \"delta\"], \"bands\"],\n"
+         << "  \"frames\": " << frames << ",\n  \"bands\": " << bands << ",\n"
+         << "  \"sample_rate\": " << sample_rate << ",\n  \"carfac_rate\": " << carfac.carfacRate() << ",\n"
+         << "  \"frame_rate_hz\": " << static_cast<double>(sample_rate) / params.publish_hop << ",\n"
+         << "  \"params\": {\"full_ihc\": " << (params.full_ihc ? "true" : "false")
+         << ", \"env_from_ihc\": " << (params.env_from_ihc ? "true" : "false")
+         << ", \"enable_agc\": " << (params.enable_agc ? "true" : "false")
+         << ", \"erb_per_step\": " << params.erb_per_step
+         << ", \"fast_attack\": " << params.fast_attack << ", \"fast_release\": " << params.fast_release
+         << ", \"slow_attack\": " << params.slow_attack << ", \"slow_release\": " << params.slow_release << "},\n"
+         << "  \"pole_hz\": [";
+    const auto& poles = carfac.poleFrequencies();
+    for (int b = 0; b < bands; ++b) meta << (b ? ", " : "") << poles(b);
+    meta << "]\n}\n";
+
+    std::cerr << "CARFAC @ " << carfac.carfacRate() << " Hz, " << bands << " bands ("
+              << poles(bands - 1) << "-" << poles(0) << " Hz); wrote " << frames << " frames to "
+              << prefix << ".f32/.json" << std::endl;
     return 0;
 }
 
@@ -344,6 +436,7 @@ int main(int argc, char** argv) {
     std::string cmd = argv[1];
 
     if (cmd == "process") return cmdProcess(argc, argv);
+    if (cmd == "features") return cmdFeatures(argc, argv);
     if (cmd == "validate") return cmdValidate(argc, argv);
     if (cmd == "info") return cmdInfo(argc, argv);
 
