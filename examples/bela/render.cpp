@@ -24,6 +24,9 @@
 #if !defined(ENABLE_SCOPE)
 #define ENABLE_SCOPE 0
 #endif
+#if !defined(ENABLE_LATENT)
+#define ENABLE_LATENT 0
+#endif
 #if !defined(CARFAC_RATE)
 #define CARFAC_RATE 0  // 0 = same as audio rate; set to e.g. 22050 for half-rate
 #endif
@@ -35,6 +38,9 @@
 #endif
 #if ENABLE_CARFAC
 #include "carfac_frontend.h"
+#endif
+#if ENABLE_LATENT && ENABLE_CARFAC
+#include "latent_layer.h"
 #endif
 #if ENABLE_SCOPE
 #include <libraries/Scope/Scope.h>
@@ -111,8 +117,15 @@ static int gPitchDecim = 0;
 #endif
 #if ENABLE_CARFAC
 static std::unique_ptr<CarfacFrontend> gCarfac;
-static std::vector<float> gEnvFast, gEnvSlow, gTransient;
+static std::vector<float> gEnvFast, gEnvSlow, gDelta;
 static int gCarfacDecim = 0;
+#endif
+#if ENABLE_LATENT && ENABLE_CARFAC
+static LatentLayer gLatentLayer;
+static LatentOutput gLatentOutput;
+static int gLatentDecim = 0;
+// Control rate decimation: 689 Hz (feature rate) / 3 = ~230 Hz
+static constexpr int kLatentControlDecim = 3;
 #endif
 #if ENABLE_SCOPE
 static Scope gScope;
@@ -209,7 +222,7 @@ bool setup(BelaContext* context, void* userData)
         const size_t bands = gCarfac->numBands();
         gEnvFast.assign(bands, 0.0f);
         gEnvSlow.assign(bands, 0.0f);
-        gTransient.assign(bands, 0.0f);
+        gDelta.assign(bands, 0.0f);
         rt_printf("CARFAC: %zu bands\n", bands);
     }
 #endif
@@ -219,6 +232,22 @@ bool setup(BelaContext* context, void* userData)
     gScopeBuffer.resize(gNumScopeBands);
     gScope.setup(gNumScopeBands, fs);
     rt_printf("Scope: %d CARFAC bands -> channels\n", gNumScopeBands);
+#endif
+
+#if ENABLE_LATENT && ENABLE_CARFAC
+    {
+        // Load latent model from project directory
+        const char* model_path = "/root/Bela/projects/audio_features/latent_model.json";
+        if (gLatentLayer.loadParams(model_path)) {
+            // Set smoothing for control rate (~230 Hz)
+            float control_rate = static_cast<float>(fs) / kHopSize / kLatentControlDecim;
+            gLatentLayer.setSmoothingMs(30.0f, control_rate);
+            rt_printf("Latent layer loaded: %d PCA dims, %d GMM components\n",
+                      LatentLayer::kPcaDims, LatentLayer::kGmmComponents);
+        } else {
+            rt_printf("Warning: Latent model not found at %s\n", model_path);
+        }
+    }
 #endif
 
     return true;
@@ -298,11 +327,26 @@ void render(BelaContext* context, void* userData)
 #endif
 
 #if ENABLE_CARFAC
-        // Publish CARFAC envelopes periodically
-        if ((gCarfacDecim++ & 0xFF) == 0) {
-            gCarfac->publish(gEnvFast, gEnvSlow, gTransient, nullptr);
+        // Publish CARFAC envelopes and run latent layer at hop boundaries
+        if ((gCarfacDecim++ & (kHopSize - 1)) == 0) {
+            gCarfac->publish(gEnvFast, gEnvSlow, gDelta, nullptr);
+
+#if ENABLE_LATENT
+            // Run latent layer at control rate (~230 Hz)
+            // Hop rate is ~689 Hz at 44.1k; decimate by 3 to reach ~230 Hz
+            if ((gLatentDecim++ % kLatentControlDecim) == 0) {
+                if (gLatentLayer.isLoaded()) {
+                    LatentInput lin;
+                    gCarfac->publishFeatures(lin);
+                    gLatentLayer.process(lin, gLatentOutput);
+
+                    // gLatentOutput.z[0..7] and gLatentOutput.r[0..13] now available
+                    // for mapping to MIDI CC, CV, or other outputs
+                }
+            }
+#endif  // ENABLE_LATENT
         }
-#endif
+#endif  // ENABLE_CARFAC
     }
 }
 

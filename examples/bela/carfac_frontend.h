@@ -3,7 +3,14 @@
 // This is a thin adapter around the CARFAC (cochlear) library that:
 // - Initializes CAR, IHC, and AGC subsystems for a mono input
 // - Processes samples inline via per-sample API (spreads CPU load evenly)
-// - Publishes per-band envelopes (fast/slow) and a transient metric
+// - Publishes per-band envelopes (fast/slow) and delta (signed derivative)
+//
+// Output signals per band:
+//   env_fast: Fast envelope (tracks energy with quick attack/release)
+//   env_slow: Slow envelope (tracks "background" energy level)
+//   delta:    Signed difference (fast - slow); positive = attack, negative = decay
+//
+// With env_fast + delta, env_slow can be recovered: env_slow = env_fast - delta
 //
 // Requires HAVE_CARFAC to be defined and CARFAC sources to be linked.
 
@@ -14,24 +21,42 @@
 #endif
 
 #include <vector>
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <memory>
 
 #include "carfac/upstream/cpp/carfac.h"
+#include "latent_input.h"
 
 class CarfacFrontend {
 public:
     struct Params {
         int sample_rate = 44100;       // Input sample rate (Bela audio rate)
         int carfac_rate = 0;           // CARFAC processing rate (0 = same as sample_rate)
-        bool enable_agc = true;
+        bool enable_agc = true;        // false: AGC (incl. lateral smoothing) never updates, open loop
+        // Fidelity. Defaults are the Bela (Cortex-A8) budget; see highFidelity() for the desktop set.
+        bool full_ihc = false;         // true: CARFAC's hair-cell model; false: half-wave rectify only
+        bool env_from_ihc = false;     // true: envelopes follow IHC output (neural activity pattern);
+                                       // false: basilar-membrane output
+        float erb_per_step = 0.0f;     // channel spacing in ERBs (0 = CARFAC default)
         int publish_hop = 256; // frames per publish
         // Envelope timing (seconds); used by the wrapper for fast/slow AR
         float fast_attack = 0.005f;
         float fast_release = 0.040f;
         float slow_attack = 0.020f;
         float slow_release = 0.200f;
+
+        // Upstream CARFAC defaults at the full input rate, for offline / desktop use.
+        static Params highFidelity(int sample_rate) {
+            Params p;
+            p.sample_rate = sample_rate;
+            p.carfac_rate = 0;
+            p.enable_agc = true;
+            p.full_ihc = true;
+            p.env_from_ihc = true;
+            return p;
+        }
     };
 
     CarfacFrontend() = default;
@@ -45,10 +70,17 @@ public:
     // Called at hop boundary to copy out latest features
     void publish(std::vector<float>& env_fast,
                  std::vector<float>& env_slow,
-                 std::vector<float>& transient,
+                 std::vector<float>& delta,
                  std::vector<float>* opt_gain = nullptr);
 
+    // Publish features for latent layer (env_fast + delta + summary stats)
+    void publishFeatures(LatentInput& out);
+
     int numBands() const { return bands_; }
+    int carfacRate() const { return carfac_fs_; }
+
+    // Pole (centre) frequency of each band in Hz, highest band first
+    const ArrayX& poleFrequencies() const { return carfac_->pole_frequencies(); }
 
     // Get current fast envelope value for a band (updated per-sample)
     float getEnvFast(int band) const { return fast_[band].env; }
@@ -79,6 +111,7 @@ private:
     int bands_ = 0;
     int hop_ = 256;
     bool agc_ = true;
+    bool env_from_ihc_ = false;
 
     // Internal per-band states
     std::vector<float> band_sig_;
