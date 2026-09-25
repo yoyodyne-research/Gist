@@ -76,6 +76,11 @@ public:
     // Publish features for latent layer (env_fast + delta + summary stats)
     void publishFeatures(LatentInput& out);
 
+    // Switch the AGC loop while running. Off freezes the AGC's current state (it stops updating), which is
+    // not the same as starting with enable_agc = false. Call from the thread that calls processSample.
+    void setAgc(bool on) { agc_ = on; }
+    bool agc() const { return agc_; }
+
     int numBands() const { return bands_; }
     int carfacRate() const { return carfac_fs_; }
 
