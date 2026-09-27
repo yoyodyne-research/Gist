@@ -11,8 +11,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <sstream>
+#include <cstdio>
+#include <cerrno>
+#include <unistd.h>
 
 #include "carfac_frontend.h"
+#include "carfac_cli.h"
 #include "latent_layer.h"
 
 // Simple WAV file reader (mono, 16-bit PCM only)
@@ -119,6 +124,8 @@ void printUsage(const char* prog) {
               << "\nCommands:\n"
               << "  features <audio.wav> <out_prefix> [options]\n"
               << "      Dump per-band CARFAC envelopes (high fidelity by default)\n"
+              << "  stream [--rate HZ] [--format s16|f32] [options]\n"
+              << "      Causal CARFAC on raw mono PCM from stdin; framed messages on stdout\n"
               << "  process <audio.wav> <model.json> [output.csv]\n"
               << "      Process audio file through CARFAC + latent layer\n"
               << "      Outputs latent signals to stdout or file\n"
@@ -247,29 +254,8 @@ int cmdFeatures(int argc, char** argv) {
     int sample_rate;
     if (!loadWav(audio_path, audio, sample_rate)) return 1;
 
-    CarfacFrontend::Params params = CarfacFrontend::Params::highFidelity(sample_rate);
-    params.publish_hop = 256;
-    for (int i = 4; i < argc; ++i) {
-        std::string a = argv[i];
-        auto next = [&]() -> std::string {
-            if (i + 1 >= argc) { std::cerr << "Missing value for " << a << "\n"; std::exit(1); }
-            return argv[++i];
-        };
-        if (a == "--bela") {
-            CarfacFrontend::Params b;
-            b.sample_rate = sample_rate;
-            b.carfac_rate = 22050;
-            b.publish_hop = params.publish_hop;
-            params = b;
-        }
-        else if (a == "--hop") params.publish_hop = std::stoi(next());
-        else if (a == "--carfac-rate") params.carfac_rate = std::stoi(next());
-        else if (a == "--erb-per-step") params.erb_per_step = std::stof(next());
-        else if (a == "--ihc") params.full_ihc = next() == "full";
-        else if (a == "--env") params.env_from_ihc = next() == "ihc";
-        else if (a == "--agc") params.enable_agc = next() == "on";
-        else { std::cerr << "Unknown option " << a << "\n"; return 1; }
-    }
+    CarfacFrontend::Params params;
+    if (!parseCarfacOptions(argc, argv, 4, sample_rate, params)) return 1;
 
     CarfacFrontend carfac;
     if (!carfac.init(params)) {
@@ -295,25 +281,92 @@ int cmdFeatures(int argc, char** argv) {
     }
 
     std::ofstream meta(prefix + ".json");
-    meta << "{\n  \"source\": \"" << audio_path << "\",\n"
-         << "  \"layout\": [\"frames\", [\"env_fast\", \"env_slow\", \"delta\"], \"bands\"],\n"
-         << "  \"frames\": " << frames << ",\n  \"bands\": " << bands << ",\n"
-         << "  \"sample_rate\": " << sample_rate << ",\n  \"carfac_rate\": " << carfac.carfacRate() << ",\n"
-         << "  \"frame_rate_hz\": " << static_cast<double>(sample_rate) / params.publish_hop << ",\n"
-         << "  \"params\": {\"full_ihc\": " << (params.full_ihc ? "true" : "false")
-         << ", \"env_from_ihc\": " << (params.env_from_ihc ? "true" : "false")
-         << ", \"enable_agc\": " << (params.enable_agc ? "true" : "false")
-         << ", \"erb_per_step\": " << params.erb_per_step
-         << ", \"fast_attack\": " << params.fast_attack << ", \"fast_release\": " << params.fast_release
-         << ", \"slow_attack\": " << params.slow_attack << ", \"slow_release\": " << params.slow_release << "},\n"
-         << "  \"pole_hz\": [";
-    const auto& poles = carfac.poleFrequencies();
-    for (int b = 0; b < bands; ++b) meta << (b ? ", " : "") << poles(b);
-    meta << "]\n}\n";
+    writeCarfacMeta(meta, audio_path, frames, sample_rate, carfac, params);
 
+    const auto& poles = carfac.poleFrequencies();
     std::cerr << "CARFAC @ " << carfac.carfacRate() << " Hz, " << bands << " bands ("
               << poles(bands - 1) << "-" << poles(0) << " Hz); wrote " << frames << " frames to "
               << prefix << ".f32/.json" << std::endl;
+    return 0;
+}
+
+// Stream protocol (little endian): each message is u32 length (of what follows), u8 type, payload.
+enum StreamMsg : uint8_t { kHello = 1, kFrame = 2, kEnd = 3 };
+
+static void writeMsg(uint8_t type, const void* payload, uint32_t n) {
+    const uint32_t len = n + 1;
+    std::fwrite(&len, 4, 1, stdout);
+    std::fwrite(&type, 1, 1, stdout);
+    if (n) std::fwrite(payload, 1, n, stdout);
+}
+
+// Causal CARFAC on a live stream: raw mono PCM in on stdin (any chunking), messages out on stdout.
+//   HELLO  JSON: the same description `features` writes as <prefix>.json ("frames": 0)
+//   FRAME  u64 frame index, then float32 env_fast[bands], env_slow[bands], delta[bands]
+//   END    at end of input
+// Frame k is the state after input samples [0, hop*(k+1)), exactly as `features` computes it, so a
+// file streamed in any chunk sizes gives identical frames.
+int cmdStream(int argc, char** argv) {
+    int sample_rate = 44100;
+    for (int i = 2; i + 1 < argc; ++i)
+        if (std::string(argv[i]) == "--rate") sample_rate = std::stoi(argv[i + 1]);
+    std::string format = "s16";
+    CarfacFrontend::Params params;
+    if (!parseCarfacOptions(argc, argv, 2, sample_rate, params, &format)) return 1;
+    if (format != "s16" && format != "f32") { std::cerr << "--format must be s16 or f32\n"; return 1; }
+    const size_t width = format == "s16" ? 2 : 4;
+
+    CarfacFrontend carfac;
+    if (!carfac.init(params)) { std::cerr << "Failed to initialize CARFAC" << std::endl; return 1; }
+    const int bands = carfac.numBands();
+
+    std::ostringstream meta;
+    writeCarfacMeta(meta, "stdin", 0, sample_rate, carfac, params);
+    const std::string hello = meta.str();
+    writeMsg(kHello, hello.data(), static_cast<uint32_t>(hello.size()));
+    std::fflush(stdout);
+
+    std::vector<unsigned char> buf(1 << 16);
+    std::vector<float> env_fast, env_slow, delta;
+    std::vector<unsigned char> frame(8 + 3 * bands * sizeof(float));
+    size_t held = 0;  // bytes of a partial sample carried to the next read
+    uint64_t k = 0;
+    int count = 0;
+    for (;;) {
+        // read(), not fread(): take whatever has arrived rather than waiting for a full buffer
+        const ssize_t r = ::read(STDIN_FILENO, buf.data() + held, buf.size() - held);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        const size_t got = static_cast<size_t>(r);
+        const size_t avail = held + got, whole = avail / width * width;
+        for (size_t i = 0; i < whole; i += width) {
+            float x;
+            if (width == 2) {
+                int16_t s;
+                std::memcpy(&s, buf.data() + i, 2);
+                x = s / 32768.0f;  // as loadWav
+            } else {
+                std::memcpy(&x, buf.data() + i, 4);
+            }
+            carfac.processSample(x);
+            if (++count >= params.publish_hop) {
+                count = 0;
+                carfac.publish(env_fast, env_slow, delta);
+                unsigned char* p = frame.data();
+                std::memcpy(p, &k, 8);
+                std::memcpy(p + 8, env_fast.data(), bands * sizeof(float));
+                std::memcpy(p + 8 + bands * sizeof(float), env_slow.data(), bands * sizeof(float));
+                std::memcpy(p + 8 + 2 * bands * sizeof(float), delta.data(), bands * sizeof(float));
+                writeMsg(kFrame, frame.data(), static_cast<uint32_t>(frame.size()));
+                ++k;
+            }
+        }
+        std::fflush(stdout);  // frames leave as soon as their audio has arrived
+        held = avail - whole;
+        if (held) std::memmove(buf.data(), buf.data() + whole, held);
+    }
+    writeMsg(kEnd, nullptr, 0);
+    std::fflush(stdout);
     return 0;
 }
 
@@ -437,6 +490,7 @@ int main(int argc, char** argv) {
 
     if (cmd == "process") return cmdProcess(argc, argv);
     if (cmd == "features") return cmdFeatures(argc, argv);
+    if (cmd == "stream") return cmdStream(argc, argv);
     if (cmd == "validate") return cmdValidate(argc, argv);
     if (cmd == "info") return cmdInfo(argc, argv);
 

@@ -64,6 +64,27 @@ target_compile_definitions(kitsune_test PRIVATE
     HAVE_CARFAC=1
 )
 
+# Live audio host for superfly (JACK via PipeWire's pipewire-jack, or the null driver without JACK)
+add_executable(superfly_audio
+    superfly_audio.cpp
+    ${BELA_DIR}/carfac_frontend.cpp
+)
+target_include_directories(superfly_audio PRIVATE ${BELA_DIR} ${CARFAC_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../../libs/carfac ${CMAKE_CURRENT_SOURCE_DIR}/../../libs)
+target_compile_definitions(superfly_audio PRIVATE HAVE_CARFAC=1)
+find_package(Threads REQUIRED)
+target_link_libraries(superfly_audio carfac Threads::Threads)
+find_package(PkgConfig)
+if(PkgConfig_FOUND)
+    pkg_check_modules(JACK jack)
+endif()
+if(JACK_FOUND)
+    target_compile_definitions(superfly_audio PRIVATE HAVE_JACK=1)
+    target_include_directories(superfly_audio PRIVATE ${JACK_INCLUDE_DIRS})
+    target_link_libraries(superfly_audio ${JACK_LINK_LIBRARIES})
+else()
+    message(STATUS "superfly_audio: JACK not found, building with the null driver only")
+endif()
+
 # Optional: Enable sanitizers for debug builds
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_options(kitsune_test PRIVATE -fsanitize=address -fsanitize=undefined)
