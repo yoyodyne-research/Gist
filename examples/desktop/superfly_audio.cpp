@@ -11,7 +11,8 @@
 // Protocol (little endian): u32 length (of what follows), u8 type, payload.
 //   host -> superfly
 //     1 HELLO   JSON: the CARFAC feature description (as kitsune_test features writes) plus "host": {...}
-//     2 FRAME   u64 k, float32 env_fast[b], env_slow[b], delta[b]   (state after samples [0, 256 (k+1)))
+//     2 FRAME   u64 k, float32 env_fast[b], env_slow[b], delta[b]   (state after global samples [0, 256 (k+1)); if the
+//               analysis ring overflowed, the hops that lost samples have no frame, so k jumps by the gap)
 //     3 END
 //     4 SOURCE  text key=value lines: at (sample), source (input|track|silence), pos (track sample at `at`),
 //               playing (0|1), track (path)
@@ -29,12 +30,14 @@
 // `render IN.wav PARAMS.f32 OUT.f32 [--mix M]` runs only the filter chain offline (parity tests):
 // PARAMS is float32 [frames][5] = kind, cutoff, q, gain_db, vca; frame k's values are set at sample 256 (k+1).
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -121,6 +124,15 @@ std::map<std::string, std::string> parseKv(const std::string& s) {
 
 bool loadWavMono(const std::string& path, std::vector<float>& out, int& rate);
 
+// A finite number from text (the whole string); false for empty, trailing junk, nan or inf.
+bool parseSeconds(const std::string& text, double& out) {
+    if (text.empty()) return false;
+    char* end = nullptr;
+    errno = 0;
+    out = std::strtod(text.c_str(), &end);
+    return errno == 0 && end == text.c_str() + text.size() && std::isfinite(out);
+}
+
 // ---------- messages from the control thread to the audio thread ----------
 struct Command {
     enum Kind { kParamsCmd, kTransportCmd, kMixCmd, kVolumeCmd, kLimiterCmd } kind;
@@ -134,6 +146,12 @@ struct Command {
     const std::string* track_name = nullptr;  // map key: stable and never modified
     bool play = false;
     int64_t pos = 0, loop_a = -1, loop_b = -1;
+};
+
+// ---------- analysis-ring gaps: after `after` samples pushed in total, the next one is global sample `resume_at` ----------
+struct Gap {
+    uint64_t after = 0;
+    uint64_t resume_at = 0;
 };
 
 // ---------- events from the audio thread to the analysis thread (stamped with the sample index) ----------
@@ -161,6 +179,9 @@ struct Host {
     // cross-thread
     Ring<Command> commands{1024};
     Ring<float> analysis{1 << 18};  // ~6 s of audio at 44.1 kHz
+    Ring<Gap> gaps{4096};           // where samples were dropped, so the analysis keeps the global clock
+    uint64_t pushed = 0;            // samples pushed into `analysis` (audio thread)
+    bool dropping = false;          // the last push failed (audio thread)
     Ring<Event> events{4096};
     std::atomic<uint64_t> dropped{0}, xruns{0};
     std::atomic<int> buffer{0};
@@ -206,14 +227,19 @@ struct Host {
                 x = in ? in[i] : 0.0f;
             } else if (playing) {
                 if (loop_b > loop_a && loop_a >= 0 && pos >= loop_b) { pos = loop_a; emitSource(); }
-                if (pos < static_cast<int64_t>(track->size())) {
+                if (pos >= 0 && pos < static_cast<int64_t>(track->size())) {
                     x = (*track)[pos++];
                 } else {
                     playing = false;
                     emitSource();
                 }
             }
-            if (!analysis.push(x)) dropped.fetch_add(1, std::memory_order_relaxed);
+            if (dropping && gaps.size() < gaps.capacity() && analysis.size() < analysis.capacity()) {
+                gaps.push(Gap{pushed, n});  // before the sample: the analysis must see the gap first
+                dropping = false;
+            }
+            if (!dropping && analysis.push(x)) ++pushed;
+            else { dropped.fetch_add(1, std::memory_order_relaxed); dropping = true; }
             const float y = static_cast<float>(chain.process(x));
             out_l[i] = y;
             if (out_r != out_l) out_r[i] = y;
@@ -262,8 +288,11 @@ void analysisLoop(Host& h, CarfacFrontend& carfac) {
     std::vector<float> env_fast, env_slow, delta, frame(3 * bands), audio(kHop);
     std::vector<unsigned char> msg(8 + 3 * bands * sizeof(float));
     std::vector<unsigned char> amsg(8 + kHop * sizeof(float));
-    uint64_t k = 0, s = 0;  // frames written, samples analysed
-    int count = 0;
+    uint64_t s = 0, popped = 0;  // global index of the next sample; samples taken from the ring
+    int count = 0;               // samples of the current hop so far
+    bool broken = false;         // the current hop spans a gap: no frame for it
+    Gap gap;
+    bool has_gap = false;
     WavWriter rec;
     std::string recording;
     Event pending;
@@ -295,14 +324,23 @@ void analysisLoop(Host& h, CarfacFrontend& carfac) {
         bool any = false;
         while (h.analysis.pop(x)) {
             any = true;
+            if (!has_gap) has_gap = h.gaps.pop(gap);
+            if (has_gap && gap.after == popped) {  // samples were dropped before this one: jump to its global index
+                s = gap.resume_at;
+                count = static_cast<int>(s % kHop);
+                broken = true;
+                has_gap = false;
+            }
+            ++popped;
             flushEvents(s);
             audio[count] = x;
             carfac.processSample(x);
             ++s;
             if (++count == kHop) {
                 count = 0;
+                if (broken) { broken = false; continue; }  // a hop with missing samples: skipped, so the frame numbers show the gap
                 if (carfac.agc() != h.agc.load()) carfac.setAgc(h.agc.load());
-                const uint64_t first = s - kHop;
+                const uint64_t first = s - kHop, k = s / kHop - 1;  // frame k ends at global sample 256 (k + 1)
                 std::memcpy(amsg.data(), &first, 8);
                 std::memcpy(amsg.data() + 8, audio.data(), kHop * sizeof(float));
                 writeMsg(kAudio, amsg.data(), static_cast<uint32_t>(amsg.size()));
@@ -312,7 +350,6 @@ void analysisLoop(Host& h, CarfacFrontend& carfac) {
                 std::memcpy(msg.data() + 8 + bands * sizeof(float), env_slow.data(), bands * sizeof(float));
                 std::memcpy(msg.data() + 8 + 2 * bands * sizeof(float), delta.data(), bands * sizeof(float));
                 writeMsg(kFrame, msg.data(), static_cast<uint32_t>(msg.size()));
-                ++k;
                 {
                     std::lock_guard<std::mutex> lock(h.rec_mu);
                     if (h.rec_path != recording) {
@@ -389,19 +426,32 @@ void controlLoop(Host& h) {
                 c.track_name = &it->first;
             }
             c.play = kv["play"] == "1";
-            c.pos = static_cast<int64_t>(std::llround(std::atof(kv["pos"].c_str()) * h.rate));
+            // positions and loops must be finite and not negative (a negative index would read outside the track)
+            double pos = 0.0, a = 0.0, b = 0.0;
+            bool ok = parseSeconds(kv.count("pos") ? kv["pos"] : "0", pos) && pos >= 0.0;
             const std::string loop = kv["loop"];
             const size_t comma = loop.find(',');
-            if (comma != std::string::npos) {
-                c.loop_a = static_cast<int64_t>(std::llround(std::atof(loop.substr(0, comma).c_str()) * h.rate));
-                c.loop_b = static_cast<int64_t>(std::llround(std::atof(loop.substr(comma + 1).c_str()) * h.rate));
+            if (ok && comma != std::string::npos) {
+                ok = parseSeconds(loop.substr(0, comma), a) && parseSeconds(loop.substr(comma + 1), b) && a >= 0.0 && b > a;
+                c.loop_a = static_cast<int64_t>(std::llround(a * h.rate));
+                c.loop_b = static_cast<int64_t>(std::llround(b * h.rate));
             }
+            if (!ok) {
+                std::cerr << "superfly_audio: ignoring transport with pos=" << kv["pos"] << " loop=" << loop << "\n";
+                continue;
+            }
+            c.pos = static_cast<int64_t>(std::llround(pos * h.rate));
             pushCommand(h, c);
         } else if (type == kSettings) {
             auto kv = parseKv(std::string(buf.begin(), buf.end()));
             Command c;
-            if (kv.count("volume_db")) { c.kind = Command::kVolumeCmd; c.value = std::pow(10.0, std::atof(kv["volume_db"].c_str()) / 20.0); pushCommand(h, c); }
-            if (kv.count("mix")) { c.kind = Command::kMixCmd; c.value = std::atof(kv["mix"].c_str()); pushCommand(h, c); }
+            double v = 0.0;
+            if (kv.count("volume_db") && parseSeconds(kv["volume_db"], v)) {
+                c.kind = Command::kVolumeCmd; c.value = std::pow(10.0, std::min(v, 24.0) / 20.0); pushCommand(h, c);
+            }
+            if (kv.count("mix") && parseSeconds(kv["mix"], v)) {
+                c.kind = Command::kMixCmd; c.value = std::max(0.0, std::min(1.0, v)); pushCommand(h, c);
+            }
             if (kv.count("limiter")) { c.kind = Command::kLimiterCmd; c.value = kv["limiter"] == "1"; pushCommand(h, c); }
             if (kv.count("agc")) h.agc.store(kv["agc"] == "1");
             if (kv.count("record")) { std::lock_guard<std::mutex> lock(h.rec_mu); h.rec_path = kv["record"]; }
