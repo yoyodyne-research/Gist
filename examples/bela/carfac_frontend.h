@@ -90,6 +90,10 @@ public:
     // Get current fast envelope value for a band (updated per-sample)
     float getEnvFast(int band) const { return fast_[band].env; }
 
+    // The neural activity pattern (inner hair cell output) of the last CARFAC step, one value per band,
+    // highest band first: what the stabilized auditory image is built from.
+    const ArrayX& nap() const;
+
 private:
     // Wrapper-side envelope followers
     struct AR {

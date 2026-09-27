@@ -64,6 +64,8 @@ bool CarfacFrontend::init(const Params& p)
 
 CarfacFrontend::~CarfacFrontend() = default;
 
+const ArrayX& CarfacFrontend::nap() const { return ear_->ihc_out(); }
+
 void CarfacFrontend::processSample(float x)
 {
     // Anti-aliasing lowpass filter (runs at input rate)

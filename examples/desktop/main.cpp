@@ -290,6 +290,50 @@ int cmdFeatures(int argc, char** argv) {
     return 0;
 }
 
+// Dump the neural activity pattern (inner hair cell output) sample by sample, for the stabilized auditory image.
+// Writes <prefix>.f32 (float32, samples x bands, highest band first) and <prefix>.json. The cochlea runs from
+// 2 s before <start_s> (or the file's start) so its AGC has settled; only [start_s, start_s + seconds) is written.
+int cmdNap(int argc, char** argv) {
+    if (argc < 6) {
+        std::cerr << "Usage: " << argv[0] << " nap <audio.wav> <out_prefix> <start_s> <seconds> [cochlea options as for features]\n";
+        return 1;
+    }
+    const char* audio_path = argv[2];
+    const std::string prefix = argv[3];
+    const double start_s = std::atof(argv[4]), seconds = std::atof(argv[5]);
+    std::vector<float> audio;
+    int sample_rate;
+    if (!loadWav(audio_path, audio, sample_rate)) return 1;
+    CarfacFrontend::Params params;
+    if (!parseCarfacOptions(argc, argv, 6, sample_rate, params)) return 1;
+    if (params.carfac_rate && params.carfac_rate != sample_rate) {
+        std::cerr << "nap needs CARFAC at the file's rate (no --carfac-rate)\n";
+        return 1;
+    }
+    CarfacFrontend carfac;
+    if (!carfac.init(params)) {
+        std::cerr << "Failed to initialize CARFAC" << std::endl;
+        return 1;
+    }
+    const int bands = carfac.numBands();
+    const long a = std::max(0L, static_cast<long>(start_s * sample_rate));
+    const long b = std::min(static_cast<long>(audio.size()), a + static_cast<long>(seconds * sample_rate));
+    const long warm = std::max(0L, a - 2L * sample_rate);
+    std::ofstream bin(prefix + ".f32", std::ios::binary);
+    std::vector<float> row(bands);
+    for (long i = warm; i < b; ++i) {
+        carfac.processSample(audio[i]);
+        if (i < a) continue;
+        const ArrayX& nap = carfac.nap();
+        for (int k = 0; k < bands; ++k) row[k] = static_cast<float>(nap(k));
+        bin.write(reinterpret_cast<const char*>(row.data()), bands * sizeof(float));
+    }
+    std::ofstream meta(prefix + ".json");
+    writeCarfacMeta(meta, audio_path, b - a, sample_rate, carfac, params);
+    std::cerr << "NAP: " << bands << " bands x " << (b - a) << " samples from " << start_s << " s -> " << prefix << ".f32\n";
+    return 0;
+}
+
 // Stream protocol (little endian): each message is u32 length (of what follows), u8 type, payload.
 enum StreamMsg : uint8_t { kHello = 1, kFrame = 2, kEnd = 3 };
 
@@ -490,6 +534,7 @@ int main(int argc, char** argv) {
 
     if (cmd == "process") return cmdProcess(argc, argv);
     if (cmd == "features") return cmdFeatures(argc, argv);
+    if (cmd == "nap") return cmdNap(argc, argv);
     if (cmd == "stream") return cmdStream(argc, argv);
     if (cmd == "validate") return cmdValidate(argc, argv);
     if (cmd == "info") return cmdInfo(argc, argv);
