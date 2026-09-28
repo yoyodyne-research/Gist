@@ -295,7 +295,7 @@ int cmdFeatures(int argc, char** argv) {
 // 2 s before <start_s> (or the file's start) so its AGC has settled; only [start_s, start_s + seconds) is written.
 int cmdNap(int argc, char** argv) {
     if (argc < 6) {
-        std::cerr << "Usage: " << argv[0] << " nap <audio.wav> <out_prefix> <start_s> <seconds> [cochlea options as for features]\n";
+        std::cerr << "Usage: " << argv[0] << " nap <audio.wav> <out_prefix> <start_s> <seconds> [--gain-db dB] [cochlea options as for features]\n";
         return 1;
     }
     const char* audio_path = argv[2];
@@ -304,8 +304,16 @@ int cmdNap(int argc, char** argv) {
     std::vector<float> audio;
     int sample_rate;
     if (!loadWav(audio_path, audio, sample_rate)) return 1;
+    // --gain-db (nap only): input level into CARFAC. Lyon's SAI demos run a full-scale file at -40 dB; at full
+    // scale the hair cells saturate and the NAP overdrives the SAI's trigger blending.
+    double gain = 1.0;
+    std::vector<char*> args(argv, argv + 6);
+    for (int i = 6; i < argc; ++i) {
+        if (std::string(argv[i]) == "--gain-db" && i + 1 < argc) gain = std::pow(10.0, std::atof(argv[++i]) / 20.0);
+        else args.push_back(argv[i]);
+    }
     CarfacFrontend::Params params;
-    if (!parseCarfacOptions(argc, argv, 6, sample_rate, params)) return 1;
+    if (!parseCarfacOptions(static_cast<int>(args.size()), args.data(), 6, sample_rate, params)) return 1;
     if (params.carfac_rate && params.carfac_rate != sample_rate) {
         std::cerr << "nap needs CARFAC at the file's rate (no --carfac-rate)\n";
         return 1;
@@ -322,7 +330,7 @@ int cmdNap(int argc, char** argv) {
     std::ofstream bin(prefix + ".f32", std::ios::binary);
     std::vector<float> row(bands);
     for (long i = warm; i < b; ++i) {
-        carfac.processSample(audio[i]);
+        carfac.processSample(static_cast<float>(gain * audio[i]));
         if (i < a) continue;
         const ArrayX& nap = carfac.nap();
         for (int k = 0; k < bands; ++k) row[k] = static_cast<float>(nap(k));
